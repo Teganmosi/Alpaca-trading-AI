@@ -1,0 +1,6 @@
+Scenario,Trades,Win Rate,PF,Max DD,Max DD (R)
+Baseline,12,50.00%,1.97,-207.98,-2.08
+Late Entry (+1),11,45.45%,1.64,-207.98,-2.08
+Early Entry (-1),11,9.09%,0.19,-675.3,-6.75
+Friction Stress (0.15%),12,50.00%,1.19,-397.45,-3.97
+Regime Shock (Chaos Only),163,34.97%,1.06,-1264.06,-12.64
