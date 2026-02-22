@@ -2,7 +2,7 @@
 # Python Version: 3.8+
 
 # Alpaca Trading API
-alpaca-trade-api>=2.0.0
+alpaca-py>=0.43.0
 
 # Data Manipulation & Numerical Computing
 pandas>=1.5.0
@@ -10,9 +10,8 @@ numpy>=1.23.0
 
 # HTTP Requests for Telemetry
 requests>=2.28.0
-dot
-pytz
-alpaca-trade-api
-pandas
-psutil
+
+# Utilities
 python-dotenv
+pytz
+psutil
