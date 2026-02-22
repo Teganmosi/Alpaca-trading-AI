@@ -10,3 +10,9 @@ numpy>=1.23.0
 
 # HTTP Requests for Telemetry
 requests>=2.28.0
+dot
+pytz
+alpaca-trade-api
+pandas
+psutil
+python-dotenv
