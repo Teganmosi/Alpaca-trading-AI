@@ -32,7 +32,8 @@ class RiskManager:
         self,
         snapshot: FeatureSnapshot,
         equity: float,
-        peak_equity: float
+        peak_equity: float,
+        signal=None  # Optional: for future signal-specific logic
     ) -> Tuple[bool, float, bool]:
         """
         Returns: (Allowed, RiskPercent, RunnersAllowed)
