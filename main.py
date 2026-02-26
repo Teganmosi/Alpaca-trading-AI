@@ -181,16 +181,15 @@ def run_trading_loop():
                 signal = StrategyEngine.get_signal(snapshot)
                 
                 if signal != Signal.NONE:
-                    allowed, risk_pct, runners_allowed = risk_mgr.check_gates(signal, equity, peak_equity)
+                    # FIXED: Pass snapshot, not signal, to check_gates
+                    allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
                     
                     if allowed:
-                        # FIXED: Safer position sizing for crypto
-                        # Use simple percentage of equity (not ATR-based which can be too large for crypto)
-                        max_position_pct = 0.10  # Max 10% of equity per trade (conservative)
+                        # Safer position sizing for crypto
+                        max_position_pct = 0.10
                         position_value = equity * max_position_pct
                         size_units = position_value / snapshot.close
                         
-                        # Additional cap: don't exceed available equity
                         if size_units * snapshot.close > equity * 0.95:
                             size_units = (equity * 0.95) / snapshot.close
                         
