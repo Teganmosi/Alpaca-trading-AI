@@ -24,6 +24,7 @@ import psutil
 SYMBOL = "BTC/USD"
 HEARTBEAT_INTERVAL_HOURS = 6
 MEMORY_THRESHOLD_MB = 250
+TRADE_COOLDOWN_MINUTES = 15  # Wait 15 minutes after closing before new entry
 API_KEY_ID = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
@@ -101,6 +102,9 @@ def run_trading_loop():
     state_machine = TradeStateMachine()
     exec_engine = ExecutionEngine(API_KEY_ID, SECRET_KEY, paper=True)
     
+    # Trade cooldown tracking
+    last_exit_time = None
+    
     try:
         equity = exec_engine.get_account_equity()
         msg = f"Alpaca Connection Verified. Initial Equity: ${equity:.2f}"
@@ -171,6 +175,9 @@ def run_trading_loop():
                     exec_engine.close_position(SYMBOL)
                     risk_mgr.record_trade(r_pnl, tag, snapshot.timestamp)
                     
+                    # Set cooldown after trade closes
+                    last_exit_time = snapshot.timestamp
+                    
                     if state_machine.context is not None:
                         journal.log_trade(state_machine.context, snapshot, r_pnl, tag)
                         bot_logger.log_event("STATE_TRANSITION", {"to": "FLAT", "reason": tag, "r_pnl": r_pnl})
@@ -182,60 +189,71 @@ def run_trading_loop():
                         print(f"[STATUS] In Trade | State: {state_machine.context.state.name} | SL: {state_machine.context.stop_loss:.2f}")
 
             if state_machine.is_flat():
-                signal = StrategyEngine.get_signal(snapshot)
+                # Check cooldown
+                if last_exit_time is not None:
+                    minutes_since_exit = (snapshot.timestamp - last_exit_time).total_seconds() / 60
+                    if minutes_since_exit < TRADE_COOLDOWN_MINUTES:
+                        print(f"[COOLDOWN] Waiting... {minutes_since_exit:.1f}/{TRADE_COOLDOWN_MINUTES} min since last trade")
                 
-                if signal != Signal.NONE:
-                    allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
+                # Only enter if cooldown has passed (or no previous trade)
+                can_trade = last_exit_time is None or (snapshot.timestamp - last_exit_time).total_seconds() / 60 >= TRADE_COOLDOWN_MINUTES
+                
+                if can_trade:
+                    signal = StrategyEngine.get_signal(snapshot)
                     
-                    if allowed:
-                        # CHANGED: Reduced from 10% to 5% for safer trading
-                        max_position_pct = 0.05
-                        position_value = equity * max_position_pct
-                        size_units = position_value / snapshot.close
+                    if signal != Signal.NONE:
+                        allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
                         
-                        if size_units * snapshot.close > equity * 0.95:
-                            size_units = (equity * 0.95) / snapshot.close
-                        
-                        print(f"[POSITION] Equity: ${equity:.2f} | Position: ${position_value:.2f} ({size_units:.6f} BTC @ ${snapshot.close:.2f})")
-                        
-                        if signal == Signal.LONG:
-                            stop_loss = snapshot.close - snapshot.atr
-                            tp_target = snapshot.close + (snapshot.atr * 2.2)
+                        if allowed:
+                            max_position_pct = 0.05
+                            position_value = equity * max_position_pct
+                            size_units = position_value / snapshot.close
+                            
+                            if size_units * snapshot.close > equity * 0.95:
+                                size_units = (equity * 0.95) / snapshot.close
+                            
+                            print(f"[POSITION] Equity: ${equity:.2f} | Position: ${position_value:.2f} ({size_units:.6f} BTC @ ${snapshot.close:.2f})")
+                            
+                            if signal == Signal.LONG:
+                                stop_loss = snapshot.close - snapshot.atr
+                                tp_target = snapshot.close + (snapshot.atr * 2.2)
+                            else:
+                                stop_loss = snapshot.close + snapshot.atr
+                                tp_target = snapshot.close - (snapshot.atr * 2.2)
+                            
+                            order_id, filled_price = exec_engine.execute_bracket_order(
+                                SYMBOL, signal, size_units, stop_loss, tp_target
+                            )
+                            
+                            entry_price = filled_price if filled_price else snapshot.close
+                            
+                            context = TradeContext(
+                                direction=signal,
+                                entry_price=entry_price,
+                                size=size_units,
+                                stop_loss=stop_loss,
+                                tp_target=tp_target,
+                                atr_at_entry=snapshot.atr,
+                                entry_time=snapshot.timestamp,
+                                runners_allowed=runners_allowed
+                            )
+                            state_machine.enter(context)
+                            
+                            order_id_str = str(order_id) if order_id else "None"
+                            bot_logger.log_event("STATE_TRANSITION", {
+                                "to": "ENTERED", 
+                                "order_id": order_id_str, 
+                                "direction": signal.name,
+                                "entry_price": entry_price
+                            })
+                            telemetry.notify("TRADE_ENTRY", f"Entered {signal.name} {SYMBOL} at {entry_price:.2f} | Size: {size_units:.4f}")
+                            print(f"[EVENT] Entry Order Submitted: {order_id_str} | Filled: {entry_price:.2f}")
                         else:
-                            stop_loss = snapshot.close + snapshot.atr
-                            tp_target = snapshot.close - (snapshot.atr * 2.2)
-                        
-                        order_id, filled_price = exec_engine.execute_bracket_order(
-                            SYMBOL, signal, size_units, stop_loss, tp_target
-                        )
-                        
-                        entry_price = filled_price if filled_price else snapshot.close
-                        
-                        context = TradeContext(
-                            direction=signal,
-                            entry_price=entry_price,
-                            size=size_units,
-                            stop_loss=stop_loss,
-                            tp_target=tp_target,
-                            atr_at_entry=snapshot.atr,
-                            entry_time=snapshot.timestamp,
-                            runners_allowed=runners_allowed
-                        )
-                        state_machine.enter(context)
-                        
-                        order_id_str = str(order_id) if order_id else "None"
-                        bot_logger.log_event("STATE_TRANSITION", {
-                            "to": "ENTERED", 
-                            "order_id": order_id_str, 
-                            "direction": signal.name,
-                            "entry_price": entry_price
-                        })
-                        telemetry.notify("TRADE_ENTRY", f"Entered {signal.name} {SYMBOL} at {entry_price:.2f} | Size: {size_units:.4f}")
-                        print(f"[EVENT] Entry Order Submitted: {order_id_str} | Filled: {entry_price:.2f}")
+                            print("[STATUS] Signal detected but Risk Gate blocked entry.")
                     else:
-                        print("[STATUS] Signal detected but Risk Gate blocked entry.")
+                        print("[STATUS] No Signal.")
                 else:
-                    print("[STATUS] No Signal.")
+                    print(f"[STATUS] Cooldown active. {TRADE_COOLDOWN_MINUTES - minutes_since_exit:.1f} min remaining.")
 
         except Exception as e:
             err_msg = f"Crash in loop: {e}"
