@@ -171,7 +171,6 @@ def run_trading_loop():
                     exec_engine.close_position(SYMBOL)
                     risk_mgr.record_trade(r_pnl, tag, snapshot.timestamp)
                     
-                    # FIXED: Check if context exists before logging
                     if state_machine.context is not None:
                         journal.log_trade(state_machine.context, snapshot, r_pnl, tag)
                         bot_logger.log_event("STATE_TRANSITION", {"to": "FLAT", "reason": tag, "r_pnl": r_pnl})
@@ -189,7 +188,8 @@ def run_trading_loop():
                     allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
                     
                     if allowed:
-                        max_position_pct = 0.10
+                        # CHANGED: Reduced from 10% to 5% for safer trading
+                        max_position_pct = 0.05
                         position_value = equity * max_position_pct
                         size_units = position_value / snapshot.close
                         
