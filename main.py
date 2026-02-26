@@ -73,37 +73,17 @@ def check_health():
     cpu_pct = process.cpu_percent(interval=None)
     return mem_mb < MEMORY_THRESHOLD_MB, mem_mb, cpu_pct
 
-def reconstruct_context(exec_engine, symbol, current_atr, snapshot_timestamp):
-    details = exec_engine.get_position_details(symbol)
-    if not details:
-        return None
-    side, qty, avg_price = details
-    sl, tp = exec_engine.get_symbol_bracket_orders(symbol)
-    return TradeContext(
-        direction=side,
-        entry_price=avg_price,
-        size=qty,
-        stop_loss=sl if sl else (avg_price - side.value * current_atr),
-        tp_target=tp if tp else (avg_price + side.value * current_atr * 2.2),
-        atr_at_entry=current_atr, 
-        entry_time=snapshot_timestamp,
-        runners_allowed=True,
-        state=TradeState.ENTERED
-    )
-
 def check_position_with_retry(exec_engine, symbol, retries=3):
-    """Check position with retry - for when Alpaca has timing issues"""
     for i in range(retries):
         has_pos = exec_engine.has_open_position(symbol)
         if has_pos:
             return True
         if i < retries - 1:
-            print(f"[DEBUG] Position check retry {i+1}/{retries}...")
             time.sleep(1)
     return False
 
 def run_trading_loop():
-    print("=== STARTING DAY 17 PRODUCTION LOOP (RECONCILED) ===")
+    print("=== STARTING PRODUCTION LOOP ===")
     data_client = CryptoHistoricalDataClient(API_KEY_ID, SECRET_KEY)
     risk_mgr = RiskManager()
     state_machine = TradeStateMachine()
@@ -123,15 +103,29 @@ def run_trading_loop():
     df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
     current_snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
 
-    # Check for existing position on startup
+    # Check for existing position
     has_position = check_position_with_retry(exec_engine, SYMBOL)
     print(f"[STARTUP] Position check: {has_position}")
     
     if has_position:
-        ctx = reconstruct_context(exec_engine, SYMBOL, current_snapshot.atr, current_snapshot.timestamp)
+        ctx = exec_engine.get_position_details(SYMBOL)
         if ctx:
-            state_machine.enter(ctx)
-            print(f"[RECON] Position reconstructed: {ctx.direction.name}")
+            side, qty, avg_price = ctx
+            stop_loss = avg_price - side.value * current_snapshot.atr
+            tp_target = avg_price + side.value * current_snapshot.atr * 2.2
+            context = TradeContext(
+                direction=side,
+                entry_price=avg_price,
+                size=qty,
+                stop_loss=stop_loss,
+                tp_target=tp_target,
+                atr_at_entry=current_snapshot.atr,
+                entry_time=current_snapshot.timestamp,
+                runners_allowed=True,
+                state=TradeState.ENTERED
+            )
+            state_machine.enter(context)
+            print(f"[RECON] Position reconstructed: {side.name}")
 
     peak_equity = equity
     last_heartbeat = datetime.now(timezone.utc)
@@ -144,7 +138,7 @@ def run_trading_loop():
                 return
 
             if (datetime.now(timezone.utc) - last_heartbeat).total_seconds() > (HEARTBEAT_INTERVAL_HOURS * 3600):
-                print(f"[HEARTBEAT] Equity: ${equity:.2f} | Mem: {mem:.1f}MB")
+                print(f"[HEARTBEAT] Equity: ${equity:.2f}")
                 last_heartbeat = datetime.now(timezone.utc)
 
             next_bar = get_next_boundary(15)
@@ -164,48 +158,49 @@ def run_trading_loop():
             print(f"[{snapshot.timestamp}] Close: {snapshot.close:.2f} | Regime: {regime}")
 
             if not state_machine.is_flat():
-                # Use retry logic when checking position during trade
+                # Check if position exists
                 actual_has_position = check_position_with_retry(exec_engine, SYMBOL)
                 if not actual_has_position:
-                    # Position might have closed - try to verify with a close attempt or wait
-                    print(f"[DEBUG] Position check failed, attempting close...")
-                    try:
-                        exec_engine.close_position(SYMBOL)
-                    except:
-                        pass
-                    time.sleep(2)
-                    # Check again after close attempt
-                    actual_has_position = check_position_with_retry(exec_engine, SYMBOL, retries=2)
-                    
-                    if not actual_has_position:
-                        print(f"[WARNING] Position disappeared! Resetting state.")
-                        state_machine._reset()
-                    else:
-                        # Position still exists, reconstruct
-                        ctx = reconstruct_context(exec_engine, SYMBOL, snapshot.atr, snapshot.timestamp)
-                        if ctx:
-                            state_machine.enter(ctx)
-                            print(f"[RECON] Position reconstructed after failed check")
+                    print(f"[WARNING] Position gone! Resetting.")
+                    state_machine._reset()
                 else:
-                    r_pnl, tag = state_machine.update(snapshot)
-                    if r_pnl is not None:
+                    # Check for SL/TP exit conditions
+                    ctx = state_machine.context
+                    direction = ctx.direction.value
+                    
+                    # Check stop loss
+                    should_stop = (
+                        (direction == 1 and snapshot.low <= ctx.stop_loss) or
+                        (direction == -1 and snapshot.high >= ctx.stop_loss)
+                    )
+                    
+                    # Check take profit
+                    should_tp = (
+                        (direction == 1 and snapshot.high >= ctx.tp_target) or
+                        (direction == -1 and snapshot.low <= ctx.tp_target)
+                    )
+                    
+                    if should_stop or should_tp:
+                        # Close the position
                         exec_engine.cancel_all_orders(SYMBOL)
                         exec_engine.close_position(SYMBOL)
+                        
+                        # Calculate PnL
+                        exit_price = ctx.stop_loss if should_stop else ctx.tp_target
+                        pnl = direction * (exit_price - ctx.entry_price) * ctx.size
+                        r_pnl = pnl / (ctx.atr_at_entry * ctx.size)
+                        tag = "SL" if should_stop else "TP"
+                        
                         risk_mgr.record_trade(r_pnl, tag, snapshot.timestamp)
                         last_exit_time = snapshot.timestamp
-                        print(f"[EVENT] Trade Closed: {tag} | R: {r_pnl:.2f}")
+                        
+                        print(f"[EVENT] Trade Closed: {tag} | Exit: ${exit_price:.2f} | R: {r_pnl:.2f}")
+                        
+                        state_machine._reset()
                     else:
-                        print(f"[STATUS] In Trade | SL: {state_machine.context.stop_loss:.2f}")
+                        print(f"[STATUS] In Trade | Entry: ${ctx.entry_price:.2f} | SL: ${ctx.stop_loss:.2f} | TP: ${ctx.tp_target:.2f}")
 
             if state_machine.is_flat():
-                # Use retry logic for position check when flat too
-                actual_has_position = check_position_with_retry(exec_engine, SYMBOL)
-                if actual_has_position:
-                    print(f"[WARNING] Hidden position detected! Reconstructing...")
-                    ctx = reconstruct_context(exec_engine, SYMBOL, snapshot.atr, snapshot.timestamp)
-                    if ctx:
-                        state_machine.enter(ctx)
-                
                 # Check cooldown
                 if last_exit_time is not None:
                     minutes_since_exit = (snapshot.timestamp - last_exit_time).total_seconds() / 60
@@ -213,7 +208,7 @@ def run_trading_loop():
                         print(f"[COOLDOWN] {minutes_since_exit:.1f}/{TRADE_COOLDOWN_MINUTES} min")
                         continue
                 
-                # Get signal and trade
+                # Check for signal
                 signal = StrategyEngine.get_signal(snapshot)
                 if signal != Signal.NONE:
                     allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
@@ -246,7 +241,7 @@ def run_trading_loop():
                                 runners_allowed=runners_allowed
                             )
                             state_machine.enter(context)
-                            print(f"[EVENT] Entered {signal.name} at {entry_price:.2f}")
+                            print(f"[EVENT] Entered {signal.name} at ${entry_price:.2f}")
                     else:
                         print("[STATUS] Risk Gate blocked")
                 else:

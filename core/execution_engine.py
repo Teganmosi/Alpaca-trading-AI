@@ -15,14 +15,11 @@ class ExecutionEngine:
         try:
             pos = self.client.get_open_position(symbol)
             qty = float(pos.qty)
-            print(f"[DEBUG] Position detected: {symbol} | Qty: {qty} | Side: {pos.side}")
             return qty > 0
         except Exception as e:
             err_str = str(e).lower()
             if "not found" in err_str or "no position" in err_str:
-                print(f"[DEBUG] No open position for {symbol}")
                 return False
-            print(f"[DEBUG] Error checking position: {e}")
             return False
 
     def get_position_details(self, symbol: str):
@@ -32,14 +29,8 @@ class ExecutionEngine:
             if qty <= 0:
                 return None
             side = Signal.LONG if pos.side == 'long' else Signal.SHORT
-            print(f"[DEBUG] Position details: {symbol} | Side: {side.name} | Qty: {qty}")
             return side, qty, float(pos.avg_entry_price)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "not found" in err_str or "no position" in err_str:
-                print(f"[DEBUG] No position details for {symbol}")
-            else:
-                print(f"[DEBUG] Error getting position details: {e}")
+        except Exception:
             return None
 
     def get_symbol_bracket_orders(self, symbol: str):
@@ -53,11 +44,15 @@ class ExecutionEngine:
                 if o.type == 'limit': 
                     tp = float(o.limit_price)
             return sl, tp
-        except Exception as e:
-            print(f"[DEBUG] Error getting bracket orders: {e}")
+        except Exception:
             return None, None
 
     def execute_bracket_order(self, symbol: str, signal: Signal, size: float, stop_loss: float, tp_target: float):
+        """
+        Execute order - but DON'T submit separate SL/TP orders.
+        Let the state machine handle exits via close_position() instead.
+        This prevents duplicate fills.
+        """
         side = OrderSide.BUY if signal == Signal.LONG else OrderSide.SELL
         is_crypto = "/" in symbol
         
@@ -91,40 +86,17 @@ class ExecutionEngine:
                 print(f"[CRITICAL] Order not filled: {final_order.status if final_order else 'timeout'}")
                 return None, None
             
-            # Get filled qty from the order directly
-            filled_qty = float(final_order.filled_qty) if final_order.filled_qty else size
             fill_price = float(final_order.filled_avg_price)
+            filled_qty = float(final_order.filled_qty) if final_order.filled_qty else size
             print(f"[EXECUTION] Order filled at ${fill_price:.2f} | Qty: {filled_qty}")
             
-            # Use filled_qty for SL/TP instead of querying position
-            if filled_qty and filled_qty > 0:
-                sl_tp_qty = filled_qty * 0.50
-                if sl_tp_qty > 0.0001:
-                    sl_side = OrderSide.SELL if signal == Signal.LONG else OrderSide.BUY
-                    try:
-                        sl_order_data = MarketOrderRequest(
-                            symbol=symbol, qty=sl_tp_qty, side=sl_side,
-                            time_in_force=TimeInForce.GTC,
-                            stop_loss=StopLossRequest(stop_price=stop_loss)
-                        )
-                        self.client.submit_order(sl_order_data)
-                        print(f"[EXECUTION] Stop loss submitted at ${stop_loss:.2f}")
-                    except Exception as e:
-                        print(f"[INFO] Stop loss not placed: {e}")
-                    try:
-                        tp_order_data = MarketOrderRequest(
-                            symbol=symbol, qty=sl_tp_qty, side=sl_side,
-                            time_in_force=TimeInForce.GTC,
-                            take_profit=TakeProfitRequest(limit_price=tp_target)
-                        )
-                        self.client.submit_order(tp_order_data)
-                        print(f"[EXECUTION] Take profit submitted at ${tp_target:.2f}")
-                    except Exception as e:
-                        print(f"[INFO] Take profit not placed: {e}")
+            # DON'T submit SL/TP orders here - let state machine handle exits
+            # The state machine will call close_position() when SL/TP is hit
+            print(f"[INFO] Position opened. SL: ${stop_loss:.2f}, TP: ${tp_target:.2f} (managed by state machine)")
             
             return order_id_str, fill_price
         else:
-            # Stocks - bracket order
+            # Stocks - use bracket order
             order_data = MarketOrderRequest(
                 symbol=symbol, qty=size, side=side, time_in_force=TimeInForce.GTC,
                 order_class=OrderClass.BRACKET,
@@ -148,11 +120,13 @@ class ExecutionEngine:
             return order_id_str, fill_price
 
     def close_position(self, symbol: str):
-        print(f"[EXECUTION] Closing position for {symbol}")
+        """Close entire position at market"""
+        print(f"[EXECUTION] Closing entire position for {symbol}")
         try:
             self.client.close_position(symbol)
+            print(f"[EXECUTION] Position closed")
         except Exception as e:
-            print(f"[EXECUTION] Note (Close Position): {e}")
+            print(f"[WARNING] Close position error: {e}")
 
     def cancel_all_orders(self, symbol: str):
         print(f"[EXECUTION] Canceling all open orders for {symbol}")
