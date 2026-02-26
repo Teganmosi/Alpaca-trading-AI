@@ -91,6 +91,17 @@ def reconstruct_context(exec_engine, symbol, current_atr, snapshot_timestamp):
         state=TradeState.ENTERED
     )
 
+def check_position_with_retry(exec_engine, symbol, retries=3):
+    """Check position with retry - for when Alpaca has timing issues"""
+    for i in range(retries):
+        has_pos = exec_engine.has_open_position(symbol)
+        if has_pos:
+            return True
+        if i < retries - 1:
+            print(f"[DEBUG] Position check retry {i+1}/{retries}...")
+            time.sleep(1)
+    return False
+
 def run_trading_loop():
     print("=== STARTING DAY 17 PRODUCTION LOOP (RECONCILED) ===")
     data_client = CryptoHistoricalDataClient(API_KEY_ID, SECRET_KEY)
@@ -112,17 +123,15 @@ def run_trading_loop():
     df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
     current_snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
 
-    # Check for existing position
-    has_position = exec_engine.has_open_position(SYMBOL)
+    # Check for existing position on startup
+    has_position = check_position_with_retry(exec_engine, SYMBOL)
     print(f"[STARTUP] Position check: {has_position}")
     
     if has_position:
         ctx = reconstruct_context(exec_engine, SYMBOL, current_snapshot.atr, current_snapshot.timestamp)
         if ctx:
             state_machine.enter(ctx)
-            print(f"[RECON] Position reconstructed: {ctx.direction.name} | SL: {ctx.stop_loss:.2f}")
-        else:
-            print("[RECON] Could not reconstruct")
+            print(f"[RECON] Position reconstructed: {ctx.direction.name}")
 
     peak_equity = equity
     last_heartbeat = datetime.now(timezone.utc)
@@ -155,11 +164,28 @@ def run_trading_loop():
             print(f"[{snapshot.timestamp}] Close: {snapshot.close:.2f} | Regime: {regime}")
 
             if not state_machine.is_flat():
-                # Verify position exists
-                actual_has_position = exec_engine.has_open_position(SYMBOL)
+                # Use retry logic when checking position during trade
+                actual_has_position = check_position_with_retry(exec_engine, SYMBOL)
                 if not actual_has_position:
-                    print(f"[WARNING] Position disappeared! Resetting state.")
-                    state_machine._reset()
+                    # Position might have closed - try to verify with a close attempt or wait
+                    print(f"[DEBUG] Position check failed, attempting close...")
+                    try:
+                        exec_engine.close_position(SYMBOL)
+                    except:
+                        pass
+                    time.sleep(2)
+                    # Check again after close attempt
+                    actual_has_position = check_position_with_retry(exec_engine, SYMBOL, retries=2)
+                    
+                    if not actual_has_position:
+                        print(f"[WARNING] Position disappeared! Resetting state.")
+                        state_machine._reset()
+                    else:
+                        # Position still exists, reconstruct
+                        ctx = reconstruct_context(exec_engine, SYMBOL, snapshot.atr, snapshot.timestamp)
+                        if ctx:
+                            state_machine.enter(ctx)
+                            print(f"[RECON] Position reconstructed after failed check")
                 else:
                     r_pnl, tag = state_machine.update(snapshot)
                     if r_pnl is not None:
@@ -172,8 +198,8 @@ def run_trading_loop():
                         print(f"[STATUS] In Trade | SL: {state_machine.context.stop_loss:.2f}")
 
             if state_machine.is_flat():
-                # Verify no hidden position
-                actual_has_position = exec_engine.has_open_position(SYMBOL)
+                # Use retry logic for position check when flat too
+                actual_has_position = check_position_with_retry(exec_engine, SYMBOL)
                 if actual_has_position:
                     print(f"[WARNING] Hidden position detected! Reconstructing...")
                     ctx = reconstruct_context(exec_engine, SYMBOL, snapshot.atr, snapshot.timestamp)
