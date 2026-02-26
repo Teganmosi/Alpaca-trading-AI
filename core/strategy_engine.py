@@ -2,57 +2,85 @@ from core.models import FeatureSnapshot, Signal
 
 class StrategyEngine:
     """
-    Multi-mode strategy engine that generates signals across different market conditions.
-    Includes: Trend Following, Mean Reversion, and Breakout modes.
+    Multi-mode strategy engine with trend alignment to prevent whipsaws.
     """
     
-    # Thresholds (tuned for 15min BTC)
-    ADX_TREND_THRESHOLD = 20  # Lowered from 25 for more signals
-    STOCH_OVERSOLD = 0.30     # More lenient for oversold
-    STOCH_OVERBOUGHT = 0.70   # More lenient for overbought
-    SLOPE_WEAK = 0.005        # Very low threshold for slope
+    # Thresholds
+    ADX_TREND_THRESHOLD = 20
+    STOCH_OVERSOLD = 0.30
+    STOCH_OVERBOUGHT = 0.70
+    SLOPE_WEAK = 0.005
     
     @staticmethod
-    def get_signal(snapshot: FeatureSnapshot) -> Signal:
-        """Determines if a trade setup is valid based on multi-mode analysis."""
+    def get_signal(snapshot: FeatureSnapshot, previous_snapshot: FeatureSnapshot = None) -> Signal:
+        """
+        Determines signal with trend alignment to prevent whipsaws.
+        
+        Key improvements:
+        1. Trade WITH the trend (1h trend direction)
+        2. Require confirmation (not just one bar)
+        """
+        
+        # Determine allowed direction based on regime
+        # Trend_Up -> only LONG
+        # Trend_Down -> only SHORT  
+        # Expansion -> allow both
+        allowed_directions = []
+        
+        if snapshot.regime in ['Trend_Up', 'Neutral']:
+            allowed_directions.append('LONG')
+        if snapshot.regime in ['Trend_Down', 'Neutral']:
+            allowed_directions.append('SHORT')
+        if snapshot.regime == 'Expansion':
+            allowed_directions = ['LONG', 'SHORT']
         
         # === MODE 1: TREND FOLLOWING ===
-        # LONG in uptrend/expansion with positive slope
-        if snapshot.regime in ['Trend_Up', 'Expansion'] and snapshot.slope > StrategyEngine.SLOPE_WEAK:
-            if snapshot.adx > StrategyEngine.ADX_TREND_THRESHOLD and snapshot.stoch < 0.65:
-                return Signal.LONG
-                
-        # SHORT in downtrend/expansion with negative slope
-        if snapshot.regime in ['Trend_Down', 'Expansion'] and snapshot.slope < -StrategyEngine.SLOPE_WEAK:
-            if snapshot.adx > StrategyEngine.ADX_TREND_THRESHOLD and snapshot.stoch > 0.35:
-                return Signal.SHORT
+        # LONG only in uptrend/expansion with positive slope
+        if 'LONG' in allowed_directions:
+            if snapshot.slope > StrategyEngine.SLOPE_WEAK:
+                if snapshot.adx > StrategyEngine.ADX_TREND_THRESHOLD and snapshot.stoch < 0.65:
+                    # Check confirmation from previous bar if available
+                    if previous_snapshot is None or previous_snapshot.stoch < snapshot.stoch:
+                        return Signal.LONG
+                        
+        # SHORT only in downtrend/expansion with negative slope
+        if 'SHORT' in allowed_directions:
+            if snapshot.slope < -StrategyEngine.SLOPE_WEAK:
+                if snapshot.adx > StrategyEngine.ADX_TREND_THRESHOLD and snapshot.stoch > 0.35:
+                    # Check confirmation from previous bar if available
+                    if previous_snapshot is None or previous_snapshot.stoch > snapshot.stoch:
+                        return Signal.SHORT
         
         # === MODE 2: MEAN REVERSION ===
-        # Oversold = LONG (expect bounce)
-        if snapshot.stoch < StrategyEngine.STOCH_OVERSOLD and snapshot.adx < 35:
-            return Signal.LONG
-            
-        # Overbought = SHORT (expect pullback)
-        if snapshot.stoch > StrategyEngine.STOCH_OVERBOUGHT and snapshot.adx < 35:
-            return Signal.SHORT
+        # Only in weak trends (ADX < 35) and aligned with regime
+        if snapshot.adx < 35:
+            # Oversold = LONG
+            if 'LONG' in allowed_directions:
+                if snapshot.stoch < StrategyEngine.STOCH_OVERSOLD:
+                    return Signal.LONG
+                    
+            # Overbought = SHORT
+            if 'SHORT' in allowed_directions:
+                if snapshot.stoch > StrategyEngine.STOCH_OVERBOUGHT:
+                    return Signal.SHORT
         
-        # === MODE 3: EMA CROSSOVER BREAKOUT ===
-        # Golden cross (fast above slow) = LONG
-        if snapshot.ema_fast > snapshot.ema_slow and snapshot.adx > 15:
-            if snapshot.atr_pct > 0.7:  # Some volatility
-                return Signal.LONG
-                
-        # Death cross (fast below slow) = SHORT
-        if snapshot.ema_fast < snapshot.ema_slow and snapshot.adx > 15:
-            if snapshot.atr_pct > 0.7:
-                return Signal.SHORT
+        # === MODE 3: EMA CROSSOVER ===
+        if snapshot.adx > 15 and snapshot.atr_pct > 0.7:
+            # Golden cross = LONG
+            if 'LONG' in allowed_directions:
+                if snapshot.ema_fast > snapshot.ema_slow:
+                    return Signal.LONG
+                    
+            # Death cross = SHORT
+            if 'SHORT' in allowed_directions:
+                if snapshot.ema_fast < snapshot.ema_slow:
+                    return Signal.SHORT
         
-        # === MODE 4: VOLATILE EXPANSION (Always in Expansion regime) ===
-        # In high volatility expansion, look for momentum continuation
+        # === MODE 4: EXPANSION MOMENTUM ===
         if snapshot.regime == 'Expansion':
-            if snapshot.slope > 0.02 and snapshot.stoch < 0.5:
+            if snapshot.slope > 0.02 and snapshot.stoch < 0.5 and 'LONG' in allowed_directions:
                 return Signal.LONG
-            if snapshot.slope < -0.02 and snapshot.stoch > 0.5:
+            if snapshot.slope < -0.02 and snapshot.stoch > 0.5 and 'SHORT' in allowed_directions:
                 return Signal.SHORT
         
         return Signal.NONE
@@ -70,34 +98,20 @@ class StrategyEngine:
         
         regime_str = regimes.get(snapshot.regime, 'UNKNOWN')
         
-        # Mode 1: Trend Following
+        # Check trend following
         if snapshot.regime in ['Trend_Up', 'Expansion'] and snapshot.slope > 0.005:
             if snapshot.adx > 20 and snapshot.stoch < 0.65:
-                return Signal.LONG, f"TREND_LONG: {regime_str} regime, slope={snapshot.slope:.4f}, ADX={snapshot.adx:.1f}, Stoch={snapshot.stoch:.2f}"
+                return Signal.LONG, f"TREND_LONG: {regime_str}, slope={snapshot.slope:.4f}"
                 
         if snapshot.regime in ['Trend_Down', 'Expansion'] and snapshot.slope < -0.005:
             if snapshot.adx > 20 and snapshot.stoch > 0.35:
-                return Signal.SHORT, f"TREND_SHORT: {regime_str} regime, slope={snapshot.slope:.4f}, ADX={snapshot.adx:.1f}, Stoch={snapshot.stoch:.2f}"
+                return Signal.SHORT, f"TREND_SHORT: {regime_str}, slope={snapshot.slope:.4f}"
         
-        # Mode 2: Mean Reversion
+        # Mean reversion
         if snapshot.stoch < 0.30 and snapshot.adx < 35:
-            return Signal.LONG, f"REVERSION_LONG: Stoch={snapshot.stoch:.2f} oversold, ADX={snapshot.adx:.1f}"
+            return Signal.LONG, f"REVERSION: Stoch={snapshot.stoch:.2f}"
             
         if snapshot.stoch > 0.70 and snapshot.adx < 35:
-            return Signal.SHORT, f"REVERSION_SHORT: Stoch={snapshot.stoch:.2f} overbought, ADX={snapshot.adx:.1f}"
+            return Signal.SHORT, f"REVERSION: Stoch={snapshot.stoch:.2f}"
         
-        # Mode 3: EMA Breakout
-        if snapshot.ema_fast > snapshot.ema_slow and snapshot.adx > 15 and snapshot.atr_pct > 0.7:
-            return Signal.LONG, f"BREAKOUT_LONG: EMA cross, ADX={snapshot.adx:.1f}, ATR%={snapshot.atr_pct:.1f}"
-            
-        if snapshot.ema_fast < snapshot.ema_slow and snapshot.adx > 15 and snapshot.atr_pct > 0.7:
-            return Signal.SHORT, f"BREAKOUT_SHORT: EMA cross, ADX={snapshot.adx:.1f}, ATR%={snapshot.atr_pct:.1f}"
-        
-        # Mode 4: Expansion momentum
-        if snapshot.regime == 'Expansion':
-            if snapshot.slope > 0.02 and snapshot.stoch < 0.5:
-                return Signal.LONG, f"EXPANSION_LONG: slope={snapshot.slope:.4f}, Stoch={snapshot.stoch:.2f}"
-            if snapshot.slope < -0.02 and snapshot.stoch > 0.5:
-                return Signal.SHORT, f"EXPANSION_SHORT: slope={snapshot.slope:.4f}, Stoch={snapshot.stoch:.2f}"
-        
-        return Signal.NONE, f"NO_SIGNAL: regime={regime_str}, slope={snapshot.slope:.4f}, stoch={snapshot.stoch:.2f}, adx={snapshot.adx:.1f}, ema_diff={snapshot.ema_fast - snapshot.ema_slow:.2f}"
+        return Signal.NONE, f"NO_SIGNAL: {regime_str} regime"
