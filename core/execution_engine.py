@@ -5,7 +5,7 @@ from core.models import Signal
 from core.telemetry import telemetry
 import time
 
-# Terminal states that end order lifecycle
+# Terminal states
 TERMINAL_STATES = {"filled", "canceled", "rejected", "expired"}
 
 class ExecutionEngine:
@@ -15,17 +15,12 @@ class ExecutionEngine:
     def execute_bracket_order(self, symbol: str, signal: Signal, size: float, stop_loss: float, tp_target: float):
         """
         Places an order for crypto with separate SL/TP.
-        Alpaca doesn't support bracket orders for crypto, so we use simple orders.
-        
-        Returns: (order_id, actual_fill_price) or (None, None) on failure.
         """
         side = OrderSide.BUY if signal == Signal.LONG else OrderSide.SELL
-        
-        # Check if this is crypto
-        is_crypto = "/" in symbol  # BTC/USD format
+        is_crypto = "/" in symbol
         
         if is_crypto:
-            # For crypto: Submit simple market order, then submit separate SL/TP
+            # For crypto: Submit simple market order first
             print(f"[EXECUTION] Submitting {side.name} market order for {symbol} | Qty: {size:.6f}")
             
             order_data = MarketOrderRequest(
@@ -36,6 +31,7 @@ class ExecutionEngine:
             )
             
             order = self.client.submit_order(order_data)
+            order_id_str = str(order.id)  # Convert UUID to string
             
             # Wait for fill
             final_order = None
@@ -58,46 +54,46 @@ class ExecutionEngine:
             fill_price = float(final_order.filled_avg_price)
             print(f"[EXECUTION] Order filled at ${fill_price:.2f}")
             
-            # Now submit separate stop loss and take profit orders
-            # Note: We submit them as bracket-style but Alpaca will handle them as separate orders
+            # Calculate remaining qty after fill (may have small difference due to fill)
+            filled_qty = float(final_order.filled_qty) if final_order.filled_qty else size
+            
+            # SL/TP orders - use smaller qty to avoid insufficient balance
+            # Leave some buffer for the SL/TP orders
+            sl_tp_qty = filled_qty * 0.99  # 99% of filled qty
+            
+            # Submit stop loss
             try:
-                # Stop loss order
                 sl_side = OrderSide.SELL if signal == Signal.LONG else OrderSide.BUY
-                sl_order = StopLimitOrderRequest(
+                sl_order_data = MarketOrderRequest(
                     symbol=symbol,
-                    qty=size,
+                    qty=sl_tp_qty,
                     side=sl_side,
                     time_in_force=TimeInForce.GTC,
-                    limit_price=stop_loss,  # Use limit for more control
-                    stop_price=stop_loss
+                    stop_loss=StopLossRequest(stop_price=stop_loss)
                 )
-                self.client.submit_order(sl_order)
-                print(f"[EXECUTION] Stop loss submitted at ${stop_loss:.2f}")
+                self.client.submit_order(sl_order_data)
+                print(f"[EXECUTION] Stop loss submitted at ${stop_loss:.2f} | Qty: {sl_tp_qty:.6f}")
             except Exception as e:
                 print(f"[WARNING] Could not submit stop loss: {e}")
             
+            # Submit take profit
             try:
-                # Take profit order  
                 tp_side = OrderSide.SELL if signal == Signal.LONG else OrderSide.BUY
-                tp_order = TakeProfitRequest(
-                    limit_price=tp_target
-                )
-                # Submit as market with TP
-                tp_order_req = MarketOrderRequest(
+                tp_order_data = MarketOrderRequest(
                     symbol=symbol,
-                    qty=size,
+                    qty=sl_tp_qty,
                     side=tp_side,
                     time_in_force=TimeInForce.GTC,
-                    take_profit=tp_order
+                    take_profit=TakeProfitRequest(limit_price=tp_target)
                 )
-                self.client.submit_order(tp_order_req)
-                print(f"[EXECUTION] Take profit submitted at ${tp_target:.2f}")
+                self.client.submit_order(tp_order_data)
+                print(f"[EXECUTION] Take profit submitted at ${tp_target:.2f} | Qty: {sl_tp_qty:.6f}")
             except Exception as e:
                 print(f"[WARNING] Could not submit take profit: {e}")
             
-            return order.id, fill_price
+            return order_id_str, fill_price
         else:
-            # For stocks: Use bracket order (original logic)
+            # For stocks: Use bracket order
             order_data = MarketOrderRequest(
                 symbol=symbol,
                 qty=size,
@@ -110,6 +106,7 @@ class ExecutionEngine:
             
             print(f"[EXECUTION] Submitting {side.name} bracket order for {symbol} | Qty: {size:.6f}")
             order = self.client.submit_order(order_data)
+            order_id_str = str(order.id)
             
             final_order = None
             for _ in range(10):
@@ -127,19 +124,15 @@ class ExecutionEngine:
             
             fill_price = float(final_order.filled_avg_price)
             print(f"[EXECUTION] Order filled at ${fill_price:.2f}")
-            return order.id, fill_price
+            return order_id_str, fill_price
 
     def _handle_partial_fill_failure(self, symbol: str, reason: str, requested_qty: float):
-        """Handles partial fill or non-fill scenarios."""
         print(f"[CRITICAL] Partial fill detected for {symbol} | Reason: {reason} | Requested: {requested_qty}")
-        
         self.cancel_all_orders(symbol)
-        
         try:
             self.close_position(symbol)
         except Exception as e:
             print(f"[WARNING] Could not close partial position: {e}")
-        
         telemetry.notify(
             "PARTIAL_FILL_ABORT",
             f"Symbol: {symbol} | Reason: {reason} | Requested Qty: {requested_qty}",
@@ -147,7 +140,6 @@ class ExecutionEngine:
         )
 
     def has_open_position(self, symbol: str) -> bool:
-        """Check if Alpaca already has a position."""
         try:
             self.client.get_open_position(symbol)
             return True
@@ -155,7 +147,6 @@ class ExecutionEngine:
             return False
 
     def get_position_details(self, symbol: str):
-        """Returns (side, qty, avg_entry_price) if position exists."""
         try:
             pos = self.client.get_open_position(symbol)
             side = Signal.LONG if pos.side == 'long' else Signal.SHORT
@@ -164,10 +155,8 @@ class ExecutionEngine:
             return None
 
     def get_symbol_bracket_orders(self, symbol: str):
-        """Returns (stop_loss, tp_target) if open orders exist."""
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
         orders = self.client.get_orders(req)
-        
         sl, tp = None, None
         for o in orders:
             if o.type == 'stop': sl = float(o.stop_price)
@@ -175,7 +164,6 @@ class ExecutionEngine:
         return sl, tp
 
     def close_position(self, symbol: str):
-        """Emergency closure."""
         print(f"[EXECUTION] Closing position for {symbol}")
         try:
             self.client.close_position(symbol)
@@ -183,7 +171,6 @@ class ExecutionEngine:
             print(f"[EXECUTION] Note (Close Position): {e}")
 
     def cancel_all_orders(self, symbol: str):
-        """Cancels all open orders for the symbol."""
         print(f"[EXECUTION] Canceling all open orders for {symbol}")
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
         open_orders = self.client.get_orders(req)

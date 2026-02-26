@@ -181,11 +181,9 @@ def run_trading_loop():
                 signal = StrategyEngine.get_signal(snapshot)
                 
                 if signal != Signal.NONE:
-                    # FIXED: Pass snapshot, not signal, to check_gates
                     allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
                     
                     if allowed:
-                        # Safer position sizing for crypto
                         max_position_pct = 0.10
                         position_value = equity * max_position_pct
                         size_units = position_value / snapshot.close
@@ -220,14 +218,16 @@ def run_trading_loop():
                         )
                         state_machine.enter(context)
                         
+                        # Convert order_id to string for JSON serialization
+                        order_id_str = str(order_id) if order_id else "None"
                         bot_logger.log_event("STATE_TRANSITION", {
                             "to": "ENTERED", 
-                            "order_id": order_id, 
+                            "order_id": order_id_str, 
                             "direction": signal.name,
                             "entry_price": entry_price
                         })
                         telemetry.notify("TRADE_ENTRY", f"Entered {signal.name} {SYMBOL} at {entry_price:.2f} | Size: {size_units:.4f}")
-                        print(f"[EVENT] Entry Order Submitted: {order_id} | Filled: {entry_price:.2f}")
+                        print(f"[EVENT] Entry Order Submitted: {order_id_str} | Filled: {entry_price:.2f}")
                     else:
                         print("[STATUS] Signal detected but Risk Gate blocked entry.")
                 else:
