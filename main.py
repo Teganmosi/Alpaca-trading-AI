@@ -24,12 +24,12 @@ import psutil
 SYMBOL = "BTC/USD"
 HEARTBEAT_INTERVAL_HOURS = 6
 MEMORY_THRESHOLD_MB = 250
-TRADE_COOLDOWN_MINUTES = 15  # Wait 15 minutes after closing before new entry
+TRADE_COOLDOWN_MINUTES = 15
 API_KEY_ID = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
 if not API_KEY_ID or not SECRET_KEY:
-    raise RuntimeError("Missing Alpaca API credentials. Please set ALPACA_API_KEY and ALPACA_SECRET_KEY.")
+    raise RuntimeError("Missing Alpaca API credentials.")
 
 def get_next_boundary(minutes=15):
     now = datetime.now(timezone.utc)
@@ -60,21 +60,18 @@ def calculate_latest_regime(df_1h):
     df['TR'] = (df['high'] - df['low']).rolling(ATR_PERIOD).mean()
     df['ATR_pct'] = df['TR'] / df['close'] * 100
     df['EMA50_slope'] = df['EMA50'].pct_change() * 100
-    
     row = df.iloc[-1]
     regime = 'Neutral'
     if row['EMA50_slope'] > 0.05: regime = 'Trend_Up'
     elif row['EMA50_slope'] < -0.05: regime = 'Trend_Down'
     elif row['ATR_pct'] > 1.3: regime = 'Expansion'
-    
     return regime, row['EMA50_slope'], row['ATR_pct']
 
 def check_health():
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 * 1024)
     cpu_pct = process.cpu_percent(interval=None)
-    is_healthy = mem_mb < MEMORY_THRESHOLD_MB
-    return is_healthy, mem_mb, cpu_pct
+    return mem_mb < MEMORY_THRESHOLD_MB, mem_mb, cpu_pct
 
 def reconstruct_context(exec_engine, symbol, current_atr, snapshot_timestamp):
     details = exec_engine.get_position_details(symbol)
@@ -96,24 +93,17 @@ def reconstruct_context(exec_engine, symbol, current_atr, snapshot_timestamp):
 
 def run_trading_loop():
     print("=== STARTING DAY 17 PRODUCTION LOOP (RECONCILED) ===")
-    
     data_client = CryptoHistoricalDataClient(API_KEY_ID, SECRET_KEY)
     risk_mgr = RiskManager()
     state_machine = TradeStateMachine()
     exec_engine = ExecutionEngine(API_KEY_ID, SECRET_KEY, paper=True)
-    
-    # Trade cooldown tracking
     last_exit_time = None
     
     try:
         equity = exec_engine.get_account_equity()
-        msg = f"Alpaca Connection Verified. Initial Equity: ${equity:.2f}"
-        print(msg)
-        telemetry.notify("BOOT", msg)
+        print(f"Alpaca Connection Verified. Initial Equity: ${equity:.2f}")
     except Exception as e:
-        msg = f"Alpaca Connection Failed: {e}"
-        print(msg)
-        telemetry.notify("FATAL", msg, severity="CRITICAL")
+        print(f"Alpaca Connection Failed: {e}")
         return
 
     df_1h_raw = fetch_hourly_data(data_client, SYMBOL)
@@ -122,17 +112,17 @@ def run_trading_loop():
     df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
     current_snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
 
-    if exec_engine.has_open_position(SYMBOL):
-        msg = f"Existing position detected for {SYMBOL}. Attempting reconstruction..."
-        print(f"[RECON] {msg}")
+    # Check for existing position
+    has_position = exec_engine.has_open_position(SYMBOL)
+    print(f"[STARTUP] Position check: {has_position}")
+    
+    if has_position:
         ctx = reconstruct_context(exec_engine, SYMBOL, current_snapshot.atr, current_snapshot.timestamp)
         if ctx:
             state_machine.enter(ctx)
-            recon_msg = f"Recon Successful: State={ctx.state.name} | Direction={ctx.direction.name} | SL={ctx.stop_loss:.2f}"
-            print(f"[RECON] {recon_msg}")
-            telemetry.notify("RECON_SUCCESS", recon_msg)
+            print(f"[RECON] Position reconstructed: {ctx.direction.name} | SL: {ctx.stop_loss:.2f}")
         else:
-            telemetry.notify("RECON_FAIL", "Failed to reconstruct context despite open position.", severity="WARNING")
+            print("[RECON] Could not reconstruct")
 
     peak_equity = equity
     last_heartbeat = datetime.now(timezone.utc)
@@ -141,92 +131,84 @@ def run_trading_loop():
         try:
             healthy, mem, cpu = check_health()
             if not healthy:
-                telemetry.notify("HEALTH_CRITICAL", f"Memory leak detected: {mem:.1f}MB. Graceful shutdown initiated.", severity="CRITICAL")
+                print(f"[CRITICAL] Memory leak: {mem:.1f}MB")
                 return
 
             if (datetime.now(timezone.utc) - last_heartbeat).total_seconds() > (HEARTBEAT_INTERVAL_HOURS * 3600):
-                telemetry.notify("HEARTBEAT", f"System Live. Equity: ${equity:.2f} | Mem: {mem:.1f}MB | CPU: {cpu:.1f}%")
+                print(f"[HEARTBEAT] Equity: ${equity:.2f} | Mem: {mem:.1f}MB")
                 last_heartbeat = datetime.now(timezone.utc)
 
             next_bar = get_next_boundary(15)
             wait_seconds = (next_bar - datetime.now(timezone.utc)).total_seconds()
-            
             print(f"Sleeping until {next_bar} (Wait: {wait_seconds:.1f}s)...")
             if wait_seconds > 0:
                 time.sleep(wait_seconds + 5)
 
             df_15m_raw = fetch_latest_data(data_client, SYMBOL)
             df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
-            
             df_1h_raw = fetch_hourly_data(data_client, SYMBOL)
             regime, slope, h_atr_pct = calculate_latest_regime(df_1h_raw)
-            
             snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
-            
             equity = exec_engine.get_account_equity()
             peak_equity = max(peak_equity, equity)
 
-            print(f"[{snapshot.timestamp}] Close: {snapshot.close:.2f} | Regime: {regime} | Slope: {slope:.4f}")
+            print(f"[{snapshot.timestamp}] Close: {snapshot.close:.2f} | Regime: {regime}")
 
             if not state_machine.is_flat():
-                r_pnl, tag = state_machine.update(snapshot)
-                if r_pnl is not None:
-                    exec_engine.cancel_all_orders(SYMBOL)
-                    exec_engine.close_position(SYMBOL)
-                    risk_mgr.record_trade(r_pnl, tag, snapshot.timestamp)
-                    
-                    # Set cooldown after trade closes
-                    last_exit_time = snapshot.timestamp
-                    
-                    if state_machine.context is not None:
-                        journal.log_trade(state_machine.context, snapshot, r_pnl, tag)
-                        bot_logger.log_event("STATE_TRANSITION", {"to": "FLAT", "reason": tag, "r_pnl": r_pnl})
-                    
-                    telemetry.notify("TRADE_EXIT", f"Closed {SYMBOL} | Reason: {tag} | R-PnL: {r_pnl:.2f}")
-                    print(f"[EVENT] Trade Closed: {tag} | R: {r_pnl:.2f}")
+                # Verify position exists
+                actual_has_position = exec_engine.has_open_position(SYMBOL)
+                if not actual_has_position:
+                    print(f"[WARNING] Position disappeared! Resetting state.")
+                    state_machine._reset()
                 else:
-                    if state_machine.context is not None:
-                        print(f"[STATUS] In Trade | State: {state_machine.context.state.name} | SL: {state_machine.context.stop_loss:.2f}")
+                    r_pnl, tag = state_machine.update(snapshot)
+                    if r_pnl is not None:
+                        exec_engine.cancel_all_orders(SYMBOL)
+                        exec_engine.close_position(SYMBOL)
+                        risk_mgr.record_trade(r_pnl, tag, snapshot.timestamp)
+                        last_exit_time = snapshot.timestamp
+                        print(f"[EVENT] Trade Closed: {tag} | R: {r_pnl:.2f}")
+                    else:
+                        print(f"[STATUS] In Trade | SL: {state_machine.context.stop_loss:.2f}")
 
             if state_machine.is_flat():
+                # Verify no hidden position
+                actual_has_position = exec_engine.has_open_position(SYMBOL)
+                if actual_has_position:
+                    print(f"[WARNING] Hidden position detected! Reconstructing...")
+                    ctx = reconstruct_context(exec_engine, SYMBOL, snapshot.atr, snapshot.timestamp)
+                    if ctx:
+                        state_machine.enter(ctx)
+                
                 # Check cooldown
                 if last_exit_time is not None:
                     minutes_since_exit = (snapshot.timestamp - last_exit_time).total_seconds() / 60
                     if minutes_since_exit < TRADE_COOLDOWN_MINUTES:
-                        print(f"[COOLDOWN] Waiting... {minutes_since_exit:.1f}/{TRADE_COOLDOWN_MINUTES} min since last trade")
+                        print(f"[COOLDOWN] {minutes_since_exit:.1f}/{TRADE_COOLDOWN_MINUTES} min")
+                        continue
                 
-                # Only enter if cooldown has passed (or no previous trade)
-                can_trade = last_exit_time is None or (snapshot.timestamp - last_exit_time).total_seconds() / 60 >= TRADE_COOLDOWN_MINUTES
-                
-                if can_trade:
-                    signal = StrategyEngine.get_signal(snapshot)
-                    
-                    if signal != Signal.NONE:
-                        allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
+                # Get signal and trade
+                signal = StrategyEngine.get_signal(snapshot)
+                if signal != Signal.NONE:
+                    allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity)
+                    if allowed:
+                        max_position_pct = 0.05
+                        position_value = equity * max_position_pct
+                        size_units = position_value / snapshot.close
                         
-                        if allowed:
-                            max_position_pct = 0.05
-                            position_value = equity * max_position_pct
-                            size_units = position_value / snapshot.close
-                            
-                            if size_units * snapshot.close > equity * 0.95:
-                                size_units = (equity * 0.95) / snapshot.close
-                            
-                            print(f"[POSITION] Equity: ${equity:.2f} | Position: ${position_value:.2f} ({size_units:.6f} BTC @ ${snapshot.close:.2f})")
-                            
-                            if signal == Signal.LONG:
-                                stop_loss = snapshot.close - snapshot.atr
-                                tp_target = snapshot.close + (snapshot.atr * 2.2)
-                            else:
-                                stop_loss = snapshot.close + snapshot.atr
-                                tp_target = snapshot.close - (snapshot.atr * 2.2)
-                            
-                            order_id, filled_price = exec_engine.execute_bracket_order(
-                                SYMBOL, signal, size_units, stop_loss, tp_target
-                            )
-                            
+                        if signal == Signal.LONG:
+                            stop_loss = snapshot.close - snapshot.atr
+                            tp_target = snapshot.close + (snapshot.atr * 2.2)
+                        else:
+                            stop_loss = snapshot.close + snapshot.atr
+                            tp_target = snapshot.close - (snapshot.atr * 2.2)
+                        
+                        order_id, filled_price = exec_engine.execute_bracket_order(
+                            SYMBOL, signal, size_units, stop_loss, tp_target
+                        )
+                        
+                        if order_id:
                             entry_price = filled_price if filled_price else snapshot.close
-                            
                             context = TradeContext(
                                 direction=signal,
                                 entry_price=entry_price,
@@ -238,48 +220,23 @@ def run_trading_loop():
                                 runners_allowed=runners_allowed
                             )
                             state_machine.enter(context)
-                            
-                            order_id_str = str(order_id) if order_id else "None"
-                            bot_logger.log_event("STATE_TRANSITION", {
-                                "to": "ENTERED", 
-                                "order_id": order_id_str, 
-                                "direction": signal.name,
-                                "entry_price": entry_price
-                            })
-                            telemetry.notify("TRADE_ENTRY", f"Entered {signal.name} {SYMBOL} at {entry_price:.2f} | Size: {size_units:.4f}")
-                            print(f"[EVENT] Entry Order Submitted: {order_id_str} | Filled: {entry_price:.2f}")
-                        else:
-                            print("[STATUS] Signal detected but Risk Gate blocked entry.")
+                            print(f"[EVENT] Entered {signal.name} at {entry_price:.2f}")
                     else:
-                        print("[STATUS] No Signal.")
+                        print("[STATUS] Risk Gate blocked")
                 else:
-                    print(f"[STATUS] Cooldown active. {TRADE_COOLDOWN_MINUTES - minutes_since_exit:.1f} min remaining.")
+                    print("[STATUS] No Signal")
 
         except Exception as e:
-            err_msg = f"Crash in loop: {e}"
-            print(f"[ERROR] {err_msg}")
-            telemetry.notify("CRASH", err_msg, severity="CRITICAL")
+            print(f"[ERROR] {e}")
             time.sleep(30)
 
-def supervisor():
-    crash_count = 0
+if __name__ == "__main__":
     while True:
         try:
             run_trading_loop()
         except KeyboardInterrupt:
-            telemetry.notify("BOT_SHUTDOWN", "User initiated graceful shutdown", severity="INFO")
-            print("\n[SUPERVISOR] Graceful shutdown received. Exiting.")
+            print("Shutdown requested")
             break
         except Exception as e:
-            crash_count += 1
-            err_msg = f"Crash #{crash_count}: {type(e).__name__}: {e}"
-            print(f"[CRITICAL] {err_msg}")
-            telemetry.notify("BOT_CRASH", err_msg, severity="CRITICAL")
-            print("[SUPERVISOR] Waiting 30 seconds before restart...")
+            print(f"[CRITICAL] {e}")
             time.sleep(30)
-            continue
-    
-    print("[SUPERVISOR] Supervisor exited.")
-
-if __name__ == "__main__":
-    supervisor()

@@ -12,10 +12,62 @@ class ExecutionEngine:
     def __init__(self, api_key: str, secret_key: str, paper: bool = True):
         self.client = TradingClient(api_key, secret_key, paper=paper)
 
+    def has_open_position(self, symbol: str) -> bool:
+        """Check if Alpaca has an open position - with better error handling."""
+        try:
+            pos = self.client.get_open_position(symbol)
+            qty = float(pos.qty)
+            print(f"[DEBUG] Position detected: {symbol} | Qty: {qty} | Side: {pos.side}")
+            return qty > 0
+        except Exception as e:
+            err_str = str(e).lower()
+            if "not found" in err_str or "no position" in err_str:
+                print(f"[DEBUG] No open position for {symbol}")
+                return False
+            # Other errors - still return False but log
+            print(f"[DEBUG] Error checking position: {e}")
+            return False
+
+    def get_position_details(self, symbol: str):
+        """Returns (side, qty, avg_entry_price) if position exists."""
+        try:
+            pos = self.client.get_open_position(symbol)
+            qty = float(pos.qty)
+            if qty <= 0:
+                print(f"[DEBUG] Position exists but qty is {qty}, treating as no position")
+                return None
+            side = Signal.LONG if pos.side == 'long' else Signal.SHORT
+            print(f"[DEBUG] Position details: {symbol} | Side: {side.name} | Qty: {qty} | AvgPrice: {pos.avg_entry_price}")
+            return side, qty, float(pos.avg_entry_price)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "not found" in err_str or "no position" in err_str:
+                print(f"[DEBUG] No position details for {symbol}")
+            else:
+                print(f"[DEBUG] Error getting position details: {e}")
+            return None
+
+    def get_symbol_bracket_orders(self, symbol: str):
+        """Returns (stop_loss, tp_target) if open orders exist."""
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+            orders = self.client.get_orders(req)
+            sl, tp = None, None
+            for o in orders:
+                if o.type == 'stop': 
+                    sl = float(o.stop_price)
+                    print(f"[DEBUG] Found stop order: {sl}")
+                if o.type == 'limit': 
+                    tp = float(o.limit_price)
+                    print(f"[DEBUG] Found limit order: {tp}")
+            return sl, tp
+        except Exception as e:
+            print(f"[DEBUG] Error getting bracket orders: {e}")
+            return None, None
+
     def execute_bracket_order(self, symbol: str, signal: Signal, size: float, stop_loss: float, tp_target: float):
         """
         Places an order for crypto with separate SL/TP.
-        For crypto on Alpaca, we need to be careful about position + SL/TP balance.
         """
         side = OrderSide.BUY if signal == Signal.LONG else OrderSide.SELL
         is_crypto = "/" in symbol
@@ -55,18 +107,14 @@ class ExecutionEngine:
             fill_price = float(final_order.filled_avg_price)
             print(f"[EXECUTION] Order filled at ${fill_price:.2f}")
             
-            # For crypto, position occupies the balance, so SL/TP may not be able to be placed
-            # We'll just record the SL/TP prices and manage them manually or via the state machine
-            # Try to submit SL/TP with small qty - but accept failure gracefully
+            # Try to get position for SL/TP
             try:
-                # Get current position qty
                 pos = self.client.get_open_position(symbol)
                 position_qty = float(pos.qty)
                 
-                # Try to submit stop loss with a smaller portion (50% of position)
-                sl_tp_qty = position_qty * 0.50  # Only use 50% for SL/TP to leave buffer
+                sl_tp_qty = position_qty * 0.50
                 
-                if sl_tp_qty > 0.0001:  # Only if meaningful qty
+                if sl_tp_qty > 0.0001:
                     sl_side = OrderSide.SELL if signal == Signal.LONG else OrderSide.BUY
                     
                     # Stop loss
@@ -79,9 +127,9 @@ class ExecutionEngine:
                             stop_loss=StopLossRequest(stop_price=stop_loss)
                         )
                         self.client.submit_order(sl_order_data)
-                        print(f"[EXECUTION] Stop loss submitted at ${stop_loss:.2f} | Qty: {sl_tp_qty:.6f}")
+                        print(f"[EXECUTION] Stop loss submitted at ${stop_loss:.2f}")
                     except Exception as e:
-                        print(f"[INFO] Stop loss not placed (expected for crypto): {e}")
+                        print(f"[INFO] Stop loss not placed: {e}")
                     
                     # Take profit
                     try:
@@ -93,12 +141,10 @@ class ExecutionEngine:
                             take_profit=TakeProfitRequest(limit_price=tp_target)
                         )
                         self.client.submit_order(tp_order_data)
-                        print(f"[EXECUTION] Take profit submitted at ${tp_target:.2f} | Qty: {sl_tp_qty:.6f}")
+                        print(f"[EXECUTION] Take profit submitted at ${tp_target:.2f}")
                     except Exception as e:
-                        print(f"[INFO] Take profit not placed (expected for crypto): {e}")
-                else:
-                    print(f"[INFO] Position too small for SL/TP orders, will manage via state machine")
-                    
+                        print(f"[INFO] Take profit not placed: {e}")
+                        
             except Exception as e:
                 print(f"[INFO] Could not get position for SL/TP: {e}")
             
@@ -149,30 +195,6 @@ class ExecutionEngine:
             f"Symbol: {symbol} | Reason: {reason} | Requested Qty: {requested_qty}",
             severity="CRITICAL"
         )
-
-    def has_open_position(self, symbol: str) -> bool:
-        try:
-            self.client.get_open_position(symbol)
-            return True
-        except Exception:
-            return False
-
-    def get_position_details(self, symbol: str):
-        try:
-            pos = self.client.get_open_position(symbol)
-            side = Signal.LONG if pos.side == 'long' else Signal.SHORT
-            return side, float(pos.qty), float(pos.avg_entry_price)
-        except Exception:
-            return None
-
-    def get_symbol_bracket_orders(self, symbol: str):
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
-        orders = self.client.get_orders(req)
-        sl, tp = None, None
-        for o in orders:
-            if o.type == 'stop': sl = float(o.stop_price)
-            if o.type == 'limit': tp = float(o.limit_price)
-        return sl, tp
 
     def close_position(self, symbol: str):
         print(f"[EXECUTION] Closing position for {symbol}")
