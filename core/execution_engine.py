@@ -91,28 +91,14 @@ class ExecutionEngine:
                 print(f"[CRITICAL] Order not filled: {final_order.status if final_order else 'timeout'}")
                 return None, None
             
+            # Get filled qty from the order directly
+            filled_qty = float(final_order.filled_qty) if final_order.filled_qty else size
             fill_price = float(final_order.filled_avg_price)
-            print(f"[EXECUTION] Order filled at ${fill_price:.2f}")
+            print(f"[EXECUTION] Order filled at ${fill_price:.2f} | Qty: {filled_qty}")
             
-            # Wait for position to settle and retry getting it
-            time.sleep(2)
-            position_qty = None
-            
-            for retry in range(3):
-                try:
-                    pos = self.client.get_open_position(symbol)
-                    position_qty = float(pos.qty)
-                    print(f"[DEBUG] Position found after {retry+1} attempt(s): qty={position_qty}")
-                    break
-                except Exception as e:
-                    if retry < 2:
-                        print(f"[DEBUG] Position not found, retrying ({retry+1}/3)...")
-                        time.sleep(1)
-                    else:
-                        print(f"[INFO] Could not get position after 3 attempts: {e}")
-            
-            if position_qty and position_qty > 0:
-                sl_tp_qty = position_qty * 0.50
+            # Use filled_qty for SL/TP instead of querying position
+            if filled_qty and filled_qty > 0:
+                sl_tp_qty = filled_qty * 0.50
                 if sl_tp_qty > 0.0001:
                     sl_side = OrderSide.SELL if signal == Signal.LONG else OrderSide.BUY
                     try:
