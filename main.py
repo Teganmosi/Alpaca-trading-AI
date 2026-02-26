@@ -170,12 +170,17 @@ def run_trading_loop():
                     exec_engine.cancel_all_orders(SYMBOL)
                     exec_engine.close_position(SYMBOL)
                     risk_mgr.record_trade(r_pnl, tag, snapshot.timestamp)
-                    journal.log_trade(state_machine.context, snapshot, r_pnl, tag)
-                    bot_logger.log_event("STATE_TRANSITION", {"to": "FLAT", "reason": tag, "r_pnl": r_pnl})
+                    
+                    # FIXED: Check if context exists before logging
+                    if state_machine.context is not None:
+                        journal.log_trade(state_machine.context, snapshot, r_pnl, tag)
+                        bot_logger.log_event("STATE_TRANSITION", {"to": "FLAT", "reason": tag, "r_pnl": r_pnl})
+                    
                     telemetry.notify("TRADE_EXIT", f"Closed {SYMBOL} | Reason: {tag} | R-PnL: {r_pnl:.2f}")
                     print(f"[EVENT] Trade Closed: {tag} | R: {r_pnl:.2f}")
                 else:
-                    print(f"[STATUS] In Trade | State: {state_machine.context.state.name} | SL: {state_machine.context.stop_loss:.2f}")
+                    if state_machine.context is not None:
+                        print(f"[STATUS] In Trade | State: {state_machine.context.state.name} | SL: {state_machine.context.stop_loss:.2f}")
 
             if state_machine.is_flat():
                 signal = StrategyEngine.get_signal(snapshot)
@@ -218,7 +223,6 @@ def run_trading_loop():
                         )
                         state_machine.enter(context)
                         
-                        # Convert order_id to string for JSON serialization
                         order_id_str = str(order_id) if order_id else "None"
                         bot_logger.log_event("STATE_TRANSITION", {
                             "to": "ENTERED", 
