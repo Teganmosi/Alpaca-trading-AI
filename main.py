@@ -24,7 +24,7 @@ import psutil
 SYMBOL = "BTC/USD"
 HEARTBEAT_INTERVAL_HOURS = 6
 MEMORY_THRESHOLD_MB = 250
-TRADE_COOLDOWN_MINUTES = 30  # Increased to prevent rapid re-entry
+TRADE_COOLDOWN_MINUTES = 30
 API_KEY_ID = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
@@ -94,7 +94,7 @@ def run_trading_loop():
     df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
     current_snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
 
-    # Only check for existing position on startup (not during loop)
+    # Only check for existing position on startup
     try:
         has_position = exec_engine.has_open_position(SYMBOL)
         print(f"[STARTUP] Position check: {has_position}")
@@ -150,34 +150,29 @@ def run_trading_loop():
 
             print(f"[{snapshot.timestamp}] Close: ${snapshot.close:.2f} | Regime: {regime}")
 
-            # USE STATE MACHINE ONLY - don't query Alpaca for position status
+            # USE STATE MACHINE ONLY
             if not state_machine.is_flat():
                 ctx = state_machine.context
                 direction = ctx.direction.value
                 
-                # Check stop loss
                 should_stop = (
                     (direction == 1 and snapshot.low <= ctx.stop_loss) or
                     (direction == -1 and snapshot.high >= ctx.stop_loss)
                 )
                 
-                # Check take profit
                 should_tp = (
                     (direction == 1 and snapshot.high >= ctx.tp_target) or
                     (direction == -1 and snapshot.low <= ctx.tp_target)
                 )
                 
-                # Also check time exit
                 elapsed_candles = (snapshot.timestamp - ctx.entry_time).total_seconds() / 900
-                should_time_exit = elapsed_candles >= 20  # 20 candles = 5 hours
+                should_time_exit = elapsed_candles >= 20
                 
                 if should_stop or should_tp or should_time_exit:
-                    # Close the position
                     exit_reason = "SL" if should_stop else ("TP" if should_tp else "TIME")
                     exec_engine.cancel_all_orders(SYMBOL)
                     exec_engine.close_position(SYMBOL)
                     
-                    # Calculate PnL
                     exit_price = ctx.stop_loss if should_stop else (ctx.tp_target if should_tp else snapshot.close)
                     pnl = direction * (exit_price - ctx.entry_price) * ctx.size
                     r_pnl = pnl / (ctx.atr_at_entry * ctx.size)
@@ -192,17 +187,16 @@ def run_trading_loop():
                     print(f"[STATUS] In Trade | Entry: ${ctx.entry_price:.2f} | SL: ${ctx.stop_loss:.2f} | TP: ${ctx.tp_target:.2f} | Bars: {elapsed_candles:.0f}")
 
             if state_machine.is_flat():
-                # Check cooldown
                 if last_exit_time is not None:
                     minutes_since_exit = (snapshot.timestamp - last_exit_time).total_seconds() / 60
                     if minutes_since_exit < TRADE_COOLDOWN_MINUTES:
                         print(f"[COOLDOWN] {minutes_since_exit:.1f}/{TRADE_COOLDOWN_MINUTES} min")
                         continue
                 
-                # Check for signal
                 signal = StrategyEngine.get_signal(snapshot)
                 if signal != Signal.NONE:
-                    allowed, risk_pct, runners_allowed = risk_mgr.check_gates(signal, equity, peak_equity)
+                    # FIXED: Pass snapshot first, then equity, peak_equity, then signal
+                    allowed, risk_pct, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity, signal)
                     if allowed:
                         max_position_pct = 0.05
                         position_value = equity * max_position_pct
