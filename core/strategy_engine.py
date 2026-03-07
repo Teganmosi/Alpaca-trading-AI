@@ -6,7 +6,7 @@ class StrategyEngine:
     """
     
     # Thresholds
-    ADX_TREND_THRESHOLD = 20
+    ADX_TREND_THRESHOLD = 25
     STOCH_OVERSOLD = 0.30
     STOCH_OVERBOUGHT = 0.70
     SLOPE_WEAK = 0.005
@@ -39,17 +39,17 @@ class StrategyEngine:
         if 'LONG' in allowed_directions:
             if snapshot.slope > StrategyEngine.SLOPE_WEAK:
                 if snapshot.adx > StrategyEngine.ADX_TREND_THRESHOLD and snapshot.stoch < 0.65:
-                    # Check confirmation from previous bar if available
-                    if previous_snapshot is None or previous_snapshot.stoch < snapshot.stoch:
-                        return Signal.LONG
+                    if snapshot.confirm_count >= 2:
+                        if previous_snapshot is None or previous_snapshot.stoch < snapshot.stoch:
+                            return Signal.LONG
                         
         # SHORT only in downtrend/expansion with negative slope
         if 'SHORT' in allowed_directions:
             if snapshot.slope < -StrategyEngine.SLOPE_WEAK:
                 if snapshot.adx > StrategyEngine.ADX_TREND_THRESHOLD and snapshot.stoch > 0.35:
-                    # Check confirmation from previous bar if available
-                    if previous_snapshot is None or previous_snapshot.stoch > snapshot.stoch:
-                        return Signal.SHORT
+                    if snapshot.confirm_count >= 2:
+                        if previous_snapshot is None or previous_snapshot.stoch > snapshot.stoch:
+                            return Signal.SHORT
         
         # === MODE 2: MEAN REVERSION ===
         # Only in weak trends (ADX < 35) and aligned with regime

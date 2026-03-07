@@ -8,10 +8,11 @@ class RiskManager:
     Does NOT own capital. Observes and Gates based on passed-in metrics.
     """
 
-    BASE_RISK_PCT = 0.01  # 1% base (increased from 0.5%)
-    DAILY_SL_LIMIT = 3   # Allow up to 3 losses per day (increased from 1)
+    BASE_RISK_PCT = 0.0075 # 0.75% base (reduced from 1%)
+    DAILY_SL_LIMIT = 1     # Allow only 1 loss per day (reduced from 3)
     DAILY_PNL_LIMIT = -2.0 # Allow up to -2R daily loss before blocking
     VOL_CAP = 1.5         # Increased from 1.2 to allow more volatility
+    MIN_ATR_PCT = 0.8      # Minimum ATR% to trade (prevents fee leakage)
     DD_RISK_MULTIPLIER = 0.5 # Less aggressive: 50% reduction in DD (was 90%)
 
     def __init__(self):
@@ -58,11 +59,22 @@ class RiskManager:
         if snapshot.atr_pct > self.VOL_CAP:
             print(f"[RISK] Volatility too high: {snapshot.atr_pct:.2f}%")
             return False, 0.0, False
+            
+        # 5. Fee-Aware Volatility Floor
+        if snapshot.atr_pct < self.MIN_ATR_PCT:
+            print(f"[RISK] Volatility too low for fees: {snapshot.atr_pct:.2f}% < {self.MIN_ATR_PCT}%")
+            return False, 0.0, False
+
+        # 6. Session Filter (Avoid Asia session 00-08 UTC)
+        hour = snapshot.timestamp.hour
+        if 0 <= hour < 8:
+            print(f"[RISK] Asia session blocked (00:00-08:00 UTC): Hour {hour}")
+            return False, 0.0, False
 
         # Position sizing
         risk_pct = self.BASE_RISK_PCT
 
-        # 5. Equity Curve Guard (less aggressive)
+        # 7. Equity Curve Guard (less aggressive)
         if equity < peak_equity:
             risk_pct *= self.DD_RISK_MULTIPLIER
 

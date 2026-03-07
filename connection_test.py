@@ -7,7 +7,7 @@ load_dotenv()
 from alpaca.data.historical import CryptoHistoricalDataClient
 from datetime import datetime, timezone, timedelta
 import pandas as pd
-from day15_paper_loop import fetch_latest_data, fetch_hourly_data, calculate_latest_regime
+from main import fetch_latest_data, fetch_hourly_data, calculate_latest_regime
 
 # ---------------- CONFIGURATION ----------------
 SYMBOL = "BTC/USD"

@@ -45,10 +45,11 @@ class FeatureEngine:
         # Setup & Confirmation logic (Calculated here to maintain stateless StrategyEngine)
         df['setup'] = (df['stoch_k'] < 0.2) & (df['ema_fast'] > df['ema_slow']) & (df['adx'] > 20)
         df['setup_active'] = df['setup'].rolling(6).max() > 0
-        df['cond_zone'] = df['close'] > df['ema_fast']
-        df['cond_cross'] = (df['stoch_k'] > df['stoch_d']) & (df['stoch_k'].shift(1) < df['stoch_d'].shift(1))
-        df['cond_atr_up'] = df['atr'] > df['atr'].shift(1)
-        df['confirm_count'] = df[['cond_zone', 'cond_cross', 'cond_atr_up']].sum(axis=1)
+        # Confirmation logic: Price Zone + Momentum + Volatility Confirmation
+        df['cond_zone'] = df['close'] > df['ema_fast']  # Bullish zone
+        df['cond_cross'] = (df['stoch_k'] > df['stoch_d']) # Positive momentum
+        df['cond_trend'] = df['close'] > df['ema_slow'] # Macro Trend confirmation
+        df['confirm_count'] = df[['cond_zone', 'cond_cross', 'cond_trend']].sum(axis=1)
         
         return df
 
