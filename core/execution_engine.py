@@ -20,6 +20,7 @@ class ExecutionEngine:
             err_str = str(e).lower()
             if "not found" in err_str or "no position" in err_str:
                 return False
+            print(f"[ERROR] has_open_position failed for {symbol}: {e}")
             return False
 
     def get_position_details(self, symbol: str):
@@ -66,8 +67,12 @@ class ExecutionEngine:
                 time_in_force=TimeInForce.GTC
             )
             
-            order = self.client.submit_order(order_data)
-            order_id_str = str(order.id)
+            try:
+                order = self.client.submit_order(order_data)
+                order_id_str = str(order.id)
+            except Exception as e:
+                print(f"[ERROR] Failed to submit order: {e}")
+                return None, None
             
             # Wait for fill
             final_order = None
@@ -103,8 +108,12 @@ class ExecutionEngine:
                 take_profit=TakeProfitRequest(limit_price=tp_target),
                 stop_loss=StopLossRequest(stop_price=stop_loss)
             )
-            order = self.client.submit_order(order_data)
-            order_id_str = str(order.id)
+            try:
+                order = self.client.submit_order(order_data)
+                order_id_str = str(order.id)
+            except Exception as e:
+                print(f"[ERROR] Failed to submit bracket order: {e}")
+                return None, None
             final_order = None
             for _ in range(10):
                 time.sleep(1)
@@ -125,8 +134,10 @@ class ExecutionEngine:
         try:
             self.client.close_position(symbol)
             print(f"[EXECUTION] Position closed")
+            return True
         except Exception as e:
             print(f"[WARNING] Close position error: {e}")
+            return False
 
     def cancel_all_orders(self, symbol: str):
         print(f"[EXECUTION] Canceling all open orders for {symbol}")

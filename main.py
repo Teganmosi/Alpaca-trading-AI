@@ -101,6 +101,8 @@ def reconstruct_position_if_needed(exec_engine, state_machine, current_snapshot)
                 print(f"[RECON] Position reconstructed: {side.name} @ ${avg_price:.2f}")
     except Exception as e:
         print(f"[STARTUP] Position check failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 def handle_active_trade(snapshot, state_machine, exec_engine, risk_mgr):
     ctx = state_machine.context
@@ -131,8 +133,12 @@ def handle_active_trade(snapshot, state_machine, exec_engine, risk_mgr):
             exit_price = snapshot.close
 
         exec_engine.cancel_all_orders(SYMBOL)
-        exec_engine.close_position(SYMBOL)
+        success = exec_engine.close_position(SYMBOL)
         
+        if not success:
+            print("[CRITICAL] Failed to close position. Retrying next cycle.")
+            return None
+
         pnl = direction * (exit_price - ctx.entry_price) * ctx.size
         r_pnl = pnl / (ctx.atr_at_entry * ctx.size)
         
@@ -165,6 +171,17 @@ def check_for_signals(snapshot, equity, peak_equity, state_machine, risk_mgr, ex
     max_position_pct = 0.05
     position_value = equity * max_position_pct
     size_units = position_value / snapshot.close
+    
+    # Alpaca Crypto does not support shorting.
+    if signal == Signal.SHORT and "/" in SYMBOL:
+        print(f"[STATUS] SHORT signal ignored for {SYMBOL} (Crypto shorting not supported on Alpaca)")
+        return
+    
+    # Double check actual position before entering (Sync Guard)
+    if exec_engine.has_open_position(SYMBOL):
+        print(f"[WARNING] Cannot enter trade: account already has a position for {SYMBOL}. Syncing state machine...")
+        reconstruct_position_if_needed(exec_engine, state_machine, snapshot)
+        return
     
     if signal == Signal.LONG:
         stop_loss = snapshot.close - snapshot.atr
