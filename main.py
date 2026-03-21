@@ -133,10 +133,20 @@ def handle_active_trade(snapshot, state_machine, exec_engine, risk_mgr):
             exit_price = snapshot.close
 
         exec_engine.cancel_all_orders(SYMBOL)
-        success = exec_engine.close_position(SYMBOL)
+        success, error_msg = exec_engine.close_position(SYMBOL)
         
+        # If close fails, verify position actually exists before retrying
         if not success:
-            print("[CRITICAL] Failed to close position. Retrying next cycle.")
+            # Check if error indicates position doesn't exist
+            position_not_found = exec_engine.is_position_not_found_error(error_msg)
+            if position_not_found:
+                # Position doesn't actually exist - verify with API and reset state
+                actual_position = exec_engine.has_open_position(SYMBOL)
+                if not actual_position:
+                    print(f"[WARNING] Position not found on exchange. Resetting state machine.")
+                    state_machine._reset()
+                    return None  # Return None to indicate no valid exit occurred
+            print(f"[CRITICAL] Failed to close position: {error_msg}. Retrying next cycle.")
             return None
 
         pnl = direction * (exit_price - ctx.entry_price) * ctx.size

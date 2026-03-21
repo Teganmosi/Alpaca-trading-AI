@@ -134,10 +134,17 @@ class ExecutionEngine:
         try:
             self.client.close_position(symbol)
             print(f"[EXECUTION] Position closed")
-            return True
+            return True, None
         except Exception as e:
             print(f"[WARNING] Close position error: {e}")
+            return False, str(e)
+
+    def is_position_not_found_error(self, error_msg: str) -> bool:
+        """Check if error indicates position doesn't exist on exchange"""
+        if not error_msg:
             return False
+        error_lower = error_msg.lower()
+        return "not found" in error_lower or "no position" in error_lower
 
     def cancel_all_orders(self, symbol: str):
         print(f"[EXECUTION] Canceling all open orders for {symbol}")
