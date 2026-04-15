@@ -1,0 +1,249 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+import time
+import signal
+import threading
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from flask import Flask
+
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+from strategies.playbook_strategy import PlaybookStrategy
+from core.models import Signal
+from core.risk_manager import RiskManager
+from core.execution_engine import ExecutionEngine
+from core.logger import bot_logger
+from core.telemetry import telemetry
+from core.journal import journal
+import logging_config
+import logging
+
+__version__ = "1.0.0"
+
+config = {
+    "SYMBOL": "BTC/USD",
+    "API_KEY_ID": os.getenv("ALPACA_API_KEY"),
+    "SECRET_KEY": os.getenv("ALPACA_SECRET_KEY"),
+    "MEMORY_THRESHOLD_MB": 500,
+    "TRADE_COOLDOWN_MINUTES": 60,
+    "HEARTBEAT_INTERVAL_HOURS": 1,
+}
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+
+# Optimized parameters
+PLAYBOOK_PARAMS = {"trend_relax": True, "sl_buffer": 0.005, "breakeven_after_tp1": True}
+
+
+def get_next_4h_boundary():
+    now = datetime.now(timezone.utc)
+    delta = 4 - (now.hour % 4)
+    if delta == 4:
+        delta = 0
+    boundary = now.replace(hour=now.hour + delta, minute=0, second=0, microsecond=0)
+    if boundary <= now:
+        boundary += timedelta(hours=4)
+    return boundary
+
+
+def fetch_4h_data(client, symbol, days=30):
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=days)
+    req = CryptoBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=TimeFrame(4, TimeFrameUnit.Hour),
+        start=start_date,
+        end=end_date,
+    )
+    bars = client.get_crypto_bars(req).df.droplevel(0)
+    bars.index = pd.to_datetime(bars.index, utc=True)
+    return bars
+
+
+def fetch_daily_data(client, symbol, days=90):
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=days)
+    req = CryptoBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=TimeFrame(amount=1, unit=TimeFrameUnit.Day),
+        start=start_date,
+        end=end_date,
+    )
+    bars = client.get_crypto_bars(req).df.droplevel(0)
+    bars.index = pd.to_datetime(bars.index, utc=True)
+    return bars
+
+
+def check_health():
+    import psutil
+
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    cpu_pct = process.cpu_percent(interval=None)
+    return mem_mb < config["MEMORY_THRESHOLD_MB"], mem_mb, cpu_pct
+
+
+def handle_partial_exits(exec_engine, position, strategy, idx):
+    exits = strategy.get_exit_signals(position, idx)
+    for exit_type, exit_price in exits:
+        if exit_type == "TP1" and not position.get("tp1_hit", False):
+            # Close 50%
+            close_size = position["size"] * 0.5
+            success, _ = exec_engine.close_partial_position(
+                config["SYMBOL"], close_size
+            )
+            if success:
+                position["tp1_hit"] = True
+                position["size"] -= close_size
+                logger.info(f"TP1 hit: Closed 50% at ${exit_price:.2f}")
+        elif exit_type == "TP2":
+            # Close remaining
+            close_size = position["size"]
+            success, _ = exec_engine.close_partial_position(
+                config["SYMBOL"], close_size
+            )
+            if success:
+                position["size"] = 0
+                logger.info(f"TP2 hit: Closed remaining at ${exit_price:.2f}")
+                return True  # Fully closed
+        elif exit_type == "SL":
+            # Close all
+            success, _ = exec_engine.close_position(config["SYMBOL"])
+            if success:
+                position["size"] = 0
+                logger.info(f"SL hit: Closed all at ${exit_price:.2f}")
+                return True
+    return False
+
+
+def run_playbook_loop():
+    logger.info("Starting Playbook Live Trading Loop")
+    logger.info(f"Playbook Bot v{__version__}")
+    logger.info(f"Parameters: {PLAYBOOK_PARAMS}")
+
+    data_client = CryptoHistoricalDataClient(config["API_KEY_ID"], config["SECRET_KEY"])
+    exec_engine = ExecutionEngine(
+        config["API_KEY_ID"],
+        config["SECRET_KEY"],
+        paper=os.getenv("TRADING_MODE", "paper") == "paper",
+    )
+    risk_mgr = RiskManager()
+
+    position = None  # {'direction': , 'entry_price': , 'size': , 'tp1_hit': False}
+
+    try:
+        equity = exec_engine.get_account_equity()
+        logger.info(f"Initial equity: ${equity:.2f}")
+    except Exception as e:
+        logger.error(f"Alpaca connection failed: {e}")
+        return
+
+    last_exit_time = None
+
+    while True:
+        try:
+            healthy, mem, _ = check_health()
+            if not healthy:
+                logger.critical(f"Memory leak: {mem:.1f}MB")
+                return
+
+            # Wait for next 4H bar
+            next_bar = get_next_4h_boundary()
+            wait_seconds = (next_bar - datetime.now(timezone.utc)).total_seconds()
+            logger.info(
+                f"Waiting for next 4H bar at {next_bar} (Wait: {wait_seconds:.1f}s)..."
+            )
+            if wait_seconds > 0:
+                time.sleep(wait_seconds + 10)  # Extra 10s
+
+            # Fetch data
+            df_daily = fetch_daily_data(data_client, config["SYMBOL"])
+            df_4h = fetch_4h_data(data_client, config["SYMBOL"])
+            strategy = PlaybookStrategy(df_daily, df_4h, **PLAYBOOK_PARAMS)
+
+            # Get latest snapshot
+            latest_idx = len(df_4h) - 1
+            row = df_4h.iloc[latest_idx]
+            current_time = row.name
+
+            logger.info(f"[{current_time}] Close: ${row['close']:.2f}")
+
+            # Handle active position
+            if position:
+                fully_closed = handle_partial_exits(
+                    exec_engine, position, strategy, latest_idx
+                )
+                if fully_closed:
+                    position = None
+                    last_exit_time = current_time
+
+            # Check for new signal
+            if not position:
+                if last_exit_time:
+                    minutes_since_exit = (
+                        current_time - last_exit_time
+                    ).total_seconds() / 60
+                    if minutes_since_exit < config["TRADE_COOLDOWN_MINUTES"]:
+                        logger.info(
+                            f"Cooldown: {minutes_since_exit:.1f}/{config['TRADE_COOLDOWN_MINUTES']} min"
+                        )
+                    else:
+                        signal = strategy.get_signal(latest_idx)
+                        if signal != Signal.NONE:
+                            equity = exec_engine.get_account_equity()
+                            position_value = equity * 0.05
+                            size_units = position_value / row["close"]
+
+                            # Execute order
+                            order_id, filled_price = exec_engine.execute_market_order(
+                                config["SYMBOL"], signal, size_units
+                            )
+                            if order_id:
+                                entry_price = (
+                                    filled_price if filled_price else row["close"]
+                                )
+                                position = {
+                                    "direction": signal.name,
+                                    "entry_price": entry_price,
+                                    "size": size_units,
+                                    "tp1_hit": False,
+                                    "entry_time": current_time,
+                                }
+                                logger.info(
+                                    f"Entered {signal.name} at ${entry_price:.2f}, size: {size_units}"
+                                )
+
+        except Exception as e:
+            logger.error(f"Error in loop: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            time.sleep(60)
+
+
+def signal_handler(signum, frame):
+    logger.info("Shutdown signal received")
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    trading_thread = threading.Thread(target=run_playbook_loop, daemon=True)
+    trading_thread.start()
+
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

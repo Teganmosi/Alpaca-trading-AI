@@ -2,8 +2,6 @@ import os
 import time
 import pandas as pd
 from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
-load_dotenv()
 
 from alpaca.data.historical import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
@@ -19,17 +17,15 @@ from core.logger import bot_logger
 from core.telemetry import telemetry
 from core.journal import journal
 import psutil
+from config import get_config
+import logging_config
+import logging
 
-# ---------------- CONFIGURATION ----------------
-SYMBOL = "BTC/USD"
-HEARTBEAT_INTERVAL_HOURS = 6
-MEMORY_THRESHOLD_MB = 250
-TRADE_COOLDOWN_MINUTES = 120
-API_KEY_ID = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+__version__ = "1.0.0"
 
-if not API_KEY_ID or not SECRET_KEY:
-    raise RuntimeError("Missing Alpaca API credentials.")
+config = get_config()
+logger = logging.getLogger(__name__)
+
 
 def get_next_boundary(minutes=60):
     now = datetime.now(timezone.utc)
@@ -37,51 +33,69 @@ def get_next_boundary(minutes=60):
     boundary = now + timedelta(minutes=delta)
     return boundary.replace(second=0, microsecond=0)
 
+
 def fetch_latest_data(client, symbol, days=5):
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days)
-    req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Hour, start=start_date, end=end_date)
+    req = CryptoBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=TimeFrame.Hour,
+        start=start_date,
+        end=end_date,
+    )
     bars = client.get_crypto_bars(req).df.droplevel(0)
-    bars.index = pd.to_datetime(bars.index, utc=True).round('h')
+    bars.index = pd.to_datetime(bars.index, utc=True).round("h")
     return bars
+
 
 def fetch_hourly_data(client, symbol, days=30):
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days)
-    req = CryptoBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Hour, start=start_date, end=end_date)
+    req = CryptoBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=TimeFrame.Hour,
+        start=start_date,
+        end=end_date,
+    )
     bars = client.get_crypto_bars(req).df.droplevel(0)
-    bars.index = pd.to_datetime(bars.index, utc=True).round('h')
+    bars.index = pd.to_datetime(bars.index, utc=True).round("h")
     return bars
+
 
 def calculate_latest_regime(df_1h):
     df = df_1h.copy()
     EMA_FAST, ATR_PERIOD = 50, 14
-    df['EMA50'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
-    df['TR'] = (df['high'] - df['low']).rolling(ATR_PERIOD).mean()
-    df['ATR_pct'] = df['TR'] / df['close'] * 100
-    df['EMA50_slope'] = df['EMA50'].pct_change() * 100
-    
+    df["EMA50"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["TR"] = (df["high"] - df["low"]).rolling(ATR_PERIOD).mean()
+    df["ATR_pct"] = df["TR"] / df["close"] * 100
+    df["EMA50_slope"] = df["EMA50"].pct_change() * 100
+
     # 1h Specific Confirmation (Price vs EMA)
-    df['above_ema'] = df['close'] > df['EMA50']
+    df["above_ema"] = df["close"] > df["EMA50"]
     row = df.iloc[-1]
-    regime = 'Neutral'
-    if row['EMA50_slope'] > 0.05: regime = 'Trend_Up'
-    elif row['EMA50_slope'] < -0.05: regime = 'Trend_Down'
-    elif row['ATR_pct'] > 1.3: regime = 'Expansion'
-    return regime, row['EMA50_slope'], row['ATR_pct']
+    regime = "Neutral"
+    if row["EMA50_slope"] > 0.05:
+        regime = "Trend_Up"
+    elif row["EMA50_slope"] < -0.05:
+        regime = "Trend_Down"
+    elif row["ATR_pct"] > 1.3:
+        regime = "Expansion"
+    return regime, row["EMA50_slope"], row["ATR_pct"]
+
 
 def check_health():
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 * 1024)
     cpu_pct = process.cpu_percent(interval=None)
-    return mem_mb < MEMORY_THRESHOLD_MB, mem_mb, cpu_pct
+    return mem_mb < config["MEMORY_THRESHOLD_MB"], mem_mb, cpu_pct
+
 
 def reconstruct_position_if_needed(exec_engine, state_machine, current_snapshot):
     try:
-        has_position = exec_engine.has_open_position(SYMBOL)
-        print(f"[STARTUP] Position check: {has_position}")
+        has_position = exec_engine.has_open_position(config["SYMBOL"])
+        logger.info(f"Position check: {has_position}")
         if has_position:
-            ctx = exec_engine.get_position_details(SYMBOL)
+            ctx = exec_engine.get_position_details(config["SYMBOL"])
             if ctx:
                 side, qty, avg_price = ctx
                 stop_loss = avg_price - side.value * current_snapshot.atr
@@ -95,32 +109,32 @@ def reconstruct_position_if_needed(exec_engine, state_machine, current_snapshot)
                     atr_at_entry=current_snapshot.atr,
                     entry_time=current_snapshot.timestamp,
                     runners_allowed=True,
-                    state=TradeState.ENTERED
+                    state=TradeState.ENTERED,
                 )
                 state_machine.enter(context)
-                print(f"[RECON] Position reconstructed: {side.name} @ ${avg_price:.2f}")
+                logger.info(f"Position reconstructed: {side.name} @ ${avg_price:.2f}")
     except Exception as e:
-        print(f"[STARTUP] Position check failed: {e}")
+        logger.error(f"Position check failed: {e}")
         import traceback
-        traceback.print_exc()
+
+        logger.error(traceback.format_exc())
+
 
 def handle_active_trade(snapshot, state_machine, exec_engine, risk_mgr):
     ctx = state_machine.context
     direction = ctx.direction.value
-    
-    should_stop = (
-        (direction == 1 and snapshot.low <= ctx.stop_loss) or
-        (direction == -1 and snapshot.high >= ctx.stop_loss)
+
+    should_stop = (direction == 1 and snapshot.low <= ctx.stop_loss) or (
+        direction == -1 and snapshot.high >= ctx.stop_loss
     )
-    
-    should_tp = (
-        (direction == 1 and snapshot.high >= ctx.tp_target) or
-        (direction == -1 and snapshot.low <= ctx.tp_target)
+
+    should_tp = (direction == 1 and snapshot.high >= ctx.tp_target) or (
+        direction == -1 and snapshot.low <= ctx.tp_target
     )
-    
+
     elapsed_candles = (snapshot.timestamp - ctx.entry_time).total_seconds() / 3600
     should_time_exit = elapsed_candles >= 20
-    
+
     if should_stop or should_tp or should_time_exit:
         if should_stop:
             exit_reason = "SL"
@@ -132,78 +146,107 @@ def handle_active_trade(snapshot, state_machine, exec_engine, risk_mgr):
             exit_reason = "TIME"
             exit_price = snapshot.close
 
-        exec_engine.cancel_all_orders(SYMBOL)
-        success, error_msg = exec_engine.close_position(SYMBOL)
-        
+        exec_engine.cancel_all_orders(config["SYMBOL"])
+        success, error_msg = exec_engine.close_position(config["SYMBOL"])
+
         # If close fails, verify position actually exists before retrying
         if not success:
             # Check if error indicates position doesn't exist
             position_not_found = exec_engine.is_position_not_found_error(error_msg)
             if position_not_found:
                 # Position doesn't actually exist - verify with API and reset state
-                actual_position = exec_engine.has_open_position(SYMBOL)
+                actual_position = exec_engine.has_open_position(config["SYMBOL"])
                 if not actual_position:
-                    print(f"[WARNING] Position not found on exchange. Resetting state machine.")
+                    logger.warning(
+                        "Position not found on exchange. Resetting state machine."
+                    )
                     state_machine._reset()
                     return None  # Return None to indicate no valid exit occurred
-            print(f"[CRITICAL] Failed to close position: {error_msg}. Retrying next cycle.")
+            logger.error(f"Failed to close position: {error_msg}. Retrying next cycle.")
             return None
 
         pnl = direction * (exit_price - ctx.entry_price) * ctx.size
         r_pnl = pnl / (ctx.atr_at_entry * ctx.size)
-        
+
         risk_mgr.record_trade(r_pnl, exit_reason, snapshot.timestamp)
-        print(f"[EVENT] Trade Closed: {exit_reason} | Exit: ${exit_price:.2f} | R: {r_pnl:.2f}")
-        
+        logger.info(
+            f"Trade closed: {exit_reason} | Exit: ${exit_price:.2f} | R: {r_pnl:.2f}"
+        )
+        logger.info(
+            "Trade closed",
+            extra={
+                "trade": {
+                    "exit_reason": exit_reason,
+                    "exit_price": exit_price,
+                    "pnl": pnl,
+                    "r_pnl": r_pnl,
+                    "exit_time": snapshot.timestamp.isoformat(),
+                }
+            },
+        )
+
         state_machine._reset()
         return snapshot.timestamp
-    
-    print(f"[STATUS] In Trade | Entry: ${ctx.entry_price:.2f} | SL: ${ctx.stop_loss:.2f} | TP: ${ctx.tp_target:.2f} | Bars: {elapsed_candles:.0f}")
+
+    logger.info(
+        f"In trade | Entry: ${ctx.entry_price:.2f} | SL: ${ctx.stop_loss:.2f} | TP: ${ctx.tp_target:.2f} | Bars: {elapsed_candles:.0f}"
+    )
     return None
 
-def check_for_signals(snapshot, equity, peak_equity, state_machine, risk_mgr, exec_engine, last_exit_time):
+
+def check_for_signals(
+    snapshot, equity, peak_equity, state_machine, risk_mgr, exec_engine, last_exit_time
+):
     if last_exit_time is not None:
         minutes_since_exit = (snapshot.timestamp - last_exit_time).total_seconds() / 60
-        if minutes_since_exit < TRADE_COOLDOWN_MINUTES:
-            print(f"[COOLDOWN] {minutes_since_exit:.1f}/{TRADE_COOLDOWN_MINUTES} min")
+        if minutes_since_exit < config["TRADE_COOLDOWN_MINUTES"]:
+            logger.info(
+                f"Cooldown: {minutes_since_exit:.1f}/{config['TRADE_COOLDOWN_MINUTES']} min"
+            )
             return
-    
+
     signal = StrategyEngine.get_signal(snapshot)
     if signal == Signal.NONE:
-        print("[STATUS] No Signal")
+        logger.info("No signal")
         return
 
-    allowed, _, runners_allowed = risk_mgr.check_gates(snapshot, equity, peak_equity, signal)
+    allowed, _, runners_allowed = risk_mgr.check_gates(
+        snapshot, equity, peak_equity, signal
+    )
     if not allowed:
-        print("[STATUS] Risk Gate blocked")
+        logger.info("Risk gate blocked")
         return
 
     max_position_pct = 0.05
     position_value = equity * max_position_pct
     size_units = position_value / snapshot.close
-    
+
     # Alpaca Crypto does not support shorting.
-    if signal == Signal.SHORT and "/" in SYMBOL:
-        print(f"[STATUS] SHORT signal ignored for {SYMBOL} (Crypto shorting not supported on Alpaca)")
+    if signal == Signal.SHORT and "/" in config["SYMBOL"]:
+        logger.info(
+            f"SHORT signal ignored for {config['SYMBOL']} (Crypto shorting not supported on Alpaca)"
+        )
         return
-    
+
     # Double check actual position before entering (Sync Guard)
-    if exec_engine.has_open_position(SYMBOL):
-        print(f"[WARNING] Cannot enter trade: account already has a position for {SYMBOL}. Syncing state machine...")
+    if exec_engine.has_open_position(config["SYMBOL"]):
+        logger.warning(
+            f"Cannot enter trade: account already has a position for {config['SYMBOL']}. Syncing state machine..."
+        )
         reconstruct_position_if_needed(exec_engine, state_machine, snapshot)
         return
-    
+
     if signal == Signal.LONG:
         stop_loss = snapshot.close - snapshot.atr
         tp_target = snapshot.close + (snapshot.atr * 2.2)
     else:
         stop_loss = snapshot.close + snapshot.atr
         tp_target = snapshot.close - (snapshot.atr * 2.2)
-    
+
     order_id, filled_price = exec_engine.execute_bracket_order(
-        SYMBOL, signal, size_units, stop_loss, tp_target
+        config["SYMBOL"], signal, size_units, stop_loss, tp_target
     )
-    
+
     if order_id:
         entry_price = filled_price if filled_price else snapshot.close
         context = TradeContext(
@@ -214,29 +257,50 @@ def check_for_signals(snapshot, equity, peak_equity, state_machine, risk_mgr, ex
             tp_target=tp_target,
             atr_at_entry=snapshot.atr,
             entry_time=snapshot.timestamp,
-            runners_allowed=runners_allowed
+            runners_allowed=runners_allowed,
         )
         state_machine.enter(context)
-        print(f"[EVENT] Entered {signal.name} at ${entry_price:.2f}")
+        logger.info(f"Entered {signal.name} at ${entry_price:.2f}")
+        logger.info(
+            "Trade entered",
+            extra={
+                "trade": {
+                    "direction": signal.name,
+                    "entry_price": entry_price,
+                    "size": size_units,
+                    "stop_loss": stop_loss,
+                    "tp_target": tp_target,
+                    "atr_at_entry": snapshot.atr,
+                    "entry_time": snapshot.timestamp.isoformat(),
+                    "symbol": config["SYMBOL"],
+                }
+            },
+        )
+
 
 def wait_for_next_bar():
     next_bar = get_next_boundary(60)
     wait_seconds = (next_bar - datetime.now(timezone.utc)).total_seconds()
-    print(f"Sleeping until {next_bar} (Wait: {wait_seconds:.1f}s)...")
+    logger.info(f"Sleeping until {next_bar} (Wait: {wait_seconds:.1f}s)...")
     if wait_seconds > 0:
         time.sleep(wait_seconds + 5)
 
-def execute_cycle(data_client, exec_engine, state_machine, risk_mgr, last_exit_time, peak_equity):
-    df_15m_raw = fetch_latest_data(data_client, SYMBOL)
+
+def execute_cycle(
+    data_client, exec_engine, state_machine, risk_mgr, last_exit_time, peak_equity
+):
+    df_15m_raw = fetch_latest_data(data_client, config["SYMBOL"])
     df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
-    df_1h_raw = fetch_hourly_data(data_client, SYMBOL)
+    df_1h_raw = fetch_hourly_data(data_client, config["SYMBOL"])
     regime, slope, _ = calculate_latest_regime(df_1h_raw)
     snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
-    
+
     equity = exec_engine.get_account_equity()
     new_peak_equity = max(peak_equity, equity)
 
-    print(f"[{snapshot.timestamp}] Close: ${snapshot.close:.2f} | Regime: {regime}")
+    logger.info(
+        f"[{snapshot.timestamp}] Close: ${snapshot.close:.2f} | Regime: {regime}"
+    )
 
     new_last_exit_time = last_exit_time
     if not state_machine.is_flat():
@@ -245,30 +309,49 @@ def execute_cycle(data_client, exec_engine, state_machine, risk_mgr, last_exit_t
             new_last_exit_time = exit_time
 
     if state_machine.is_flat():
-        check_for_signals(snapshot, equity, new_peak_equity, state_machine, risk_mgr, exec_engine, new_last_exit_time)
-        
+        check_for_signals(
+            snapshot,
+            equity,
+            new_peak_equity,
+            state_machine,
+            risk_mgr,
+            exec_engine,
+            new_last_exit_time,
+        )
+
     return equity, new_peak_equity, new_last_exit_time
 
+
 def run_trading_loop():
-    print("=== STARTING PRODUCTION LOOP (STATE MACHINE ONLY) ===")
-    data_client = CryptoHistoricalDataClient(API_KEY_ID, SECRET_KEY)
+    logger.info("Starting production loop (state machine only)")
+    logger.info(f"Trading Bot v{__version__}")
+    logger.info(
+        f"Loaded config: SYMBOL={config['SYMBOL']}, HEARTBEAT={config['HEARTBEAT_INTERVAL_HOURS']}h, MEMORY_THRESHOLD={config['MEMORY_THRESHOLD_MB']}MB, COOLDOWN={config['TRADE_COOLDOWN_MINUTES']}min, API_KEY_ID={'*' * len(config['API_KEY_ID'])}, SECRET_KEY={'*' * len(config['SECRET_KEY'])}"
+    )
+    data_client = CryptoHistoricalDataClient(config["API_KEY_ID"], config["SECRET_KEY"])
     risk_mgr = RiskManager()
     state_machine = TradeStateMachine()
-    exec_engine = ExecutionEngine(API_KEY_ID, SECRET_KEY, paper=True)
+    exec_engine = ExecutionEngine(
+        config["API_KEY_ID"],
+        config["SECRET_KEY"],
+        paper=os.getenv("TRADING_MODE", "paper") == "paper",
+    )
     last_exit_time = None
-    
+
     try:
         equity = exec_engine.get_account_equity()
-        print(f"Alpaca Connection Verified. Initial Equity: ${equity:.2f}")
+        logger.info(f"Alpaca connection verified. Initial equity: ${equity:.2f}")
     except Exception as e:
-        print(f"Alpaca Connection Failed: {e}")
+        logger.error(f"Alpaca connection failed: {e}")
         return
 
-    df_1h_raw = fetch_hourly_data(data_client, SYMBOL)
+    df_1h_raw = fetch_hourly_data(data_client, config["SYMBOL"])
     regime, slope, _ = calculate_latest_regime(df_1h_raw)
-    df_15m_raw = fetch_latest_data(data_client, SYMBOL)
+    df_15m_raw = fetch_latest_data(data_client, config["SYMBOL"])
     df_15m = FeatureEngine.calculate_metrics(df_15m_raw)
-    current_snapshot = FeatureEngine.get_snapshot(df_15m, -1, regime=regime, slope=slope)
+    current_snapshot = FeatureEngine.get_snapshot(
+        df_15m, -1, regime=regime, slope=slope
+    )
 
     reconstruct_position_if_needed(exec_engine, state_machine, current_snapshot)
 
@@ -279,34 +362,44 @@ def run_trading_loop():
         try:
             healthy, mem, _ = check_health()
             if not healthy:
-                print(f"[CRITICAL] Memory leak: {mem:.1f}MB")
+                logger.critical(f"Memory leak: {mem:.1f}MB")
                 return
 
-            if (datetime.now(timezone.utc) - last_heartbeat).total_seconds() > (HEARTBEAT_INTERVAL_HOURS * 3600):
-                print(f"[HEARTBEAT] Equity: ${equity:.2f}")
+            if (datetime.now(timezone.utc) - last_heartbeat).total_seconds() > (
+                config["HEARTBEAT_INTERVAL_HOURS"] * 3600
+            ):
+                logger.info(f"Heartbeat: Equity: ${equity:.2f}")
                 last_heartbeat = datetime.now(timezone.utc)
 
             wait_for_next_bar()
 
             equity, peak_equity, last_exit_time = execute_cycle(
-                data_client, exec_engine, state_machine, risk_mgr, last_exit_time, peak_equity
+                data_client,
+                exec_engine,
+                state_machine,
+                risk_mgr,
+                last_exit_time,
+                peak_equity,
             )
 
         except Exception as e:
-            print(f"[ERROR] {e}")
+            logger.error(f"{e}")
             import traceback
-            traceback.print_exc()
+
+            logger.error(traceback.format_exc())
             time.sleep(30)
+
 
 if __name__ == "__main__":
     while True:
         try:
             run_trading_loop()
         except KeyboardInterrupt:
-            print("Shutdown requested")
+            logger.info("Shutdown requested")
             break
         except Exception as e:
-            print(f"[CRITICAL] {e}")
+            logger.critical(f"Critical failure: {e}")
             import traceback
-            traceback.print_exc()
-            time.sleep(30)
+
+            logger.critical(traceback.format_exc())
+            break
