@@ -43,6 +43,21 @@ def health():
     return {"status": "ok"}
 
 
+def get_recent_logs(lines=50):
+    log_file = "logs/trading.log"
+    if not os.path.exists(log_file):
+        return "Log file not found yet."
+    with open(log_file, "r") as f:
+        lines_list = f.readlines()[-lines:]
+    return "".join(lines_list)
+
+
+@app.route("/logs")
+def logs():
+    content = get_recent_logs()
+    return f"<pre>{content}</pre>", 200, {"Content-Type": "text/html"}
+
+
 # Optimized parameters
 PLAYBOOK_PARAMS = {"trend_relax": True, "sl_buffer": 0.005, "breakeven_after_tp1": True}
 
