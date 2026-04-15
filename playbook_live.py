@@ -5,6 +5,7 @@ load_dotenv()
 import time
 import signal
 import threading
+import json
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from flask import Flask
@@ -35,6 +36,23 @@ config = {
 }
 logger = logging.getLogger(__name__)
 
+
+class BotState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_signal_time = None
+        self.last_signal_type = "NONE"
+        self.current_price = 0.0
+        self.rsi_value = 0.0
+        self.stoch_k = 0.0
+        self.stoch_d = 0.0
+        self.adx_value = 0.0
+        self.open_position = None
+        self.trade_history = []
+
+
+bot_state = BotState()
+
 app = Flask(__name__)
 
 
@@ -56,6 +74,47 @@ def get_recent_logs(lines=50):
 def logs():
     content = get_recent_logs()
     return f"<pre>{content}</pre>", 200, {"Content-Type": "text/html"}
+
+
+@app.route("/dashboard")
+def dashboard():
+    with bot_state.lock:
+        uptime = "N/A"  # Could calculate from start time
+        html = f"""
+        <html>
+        <head>
+            <title>Bot Dashboard</title>
+            <meta http-equiv="refresh" content="10">
+            <style>
+                body {{ background: #121212; color: #fff; font-family: Arial, sans-serif; padding: 20px; }}
+                h1, h2 {{ color: #00ff00; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #333; padding: 8px; text-align: left; }}
+                th {{ background: #333; }}
+            </style>
+        </head>
+        <body>
+            <h1>Trading Bot Dashboard</h1>
+            <h2>Bot Status: Running | Uptime: {uptime}</h2>
+            <h3>Market Data</h3>
+            <p>Current Price: ${bot_state.current_price:.2f}</p>
+            <p>RSI: {bot_state.rsi_value:.2f}</p>
+            <p>Stochastic K: {bot_state.stoch_k:.2f}</p>
+            <p>Stochastic D: {bot_state.stoch_d:.2f}</p>
+            <p>ADX: {bot_state.adx_value:.2f}</p>
+            <h3>Last Signal</h3>
+            <p>Type: {bot_state.last_signal_type} at {bot_state.last_signal_time}</p>
+            <h3>Active Position</h3>
+            {"<p>No active position</p>" if not bot_state.open_position else f"<p>Side: {bot_state.open_position['direction']}, Entry: ${bot_state.open_position['entry_price']:.2f}</p>"}
+            <h3>Recent Trades</h3>
+            <table>
+                <tr><th>Date</th><th>Type</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Status</th></tr>
+                {"".join(f"<tr><td>{t.get('date', 'N/A')}</td><td>{t.get('type', 'N/A')}</td><td>{t.get('entry', 'N/A')}</td><td>{t.get('exit', 'N/A')}</td><td>{t.get('pnl', 'N/A')}</td><td>{t.get('status', 'N/A')}</td></tr>" for t in bot_state.trade_history[-10:])}
+            </table>
+        </body>
+        </html>
+        """
+        return html
 
 
 # Optimized parameters
@@ -195,6 +254,10 @@ def run_playbook_loop():
 
             logger.info(f"[{current_time}] Close: ${row['close']:.2f}")
 
+            with bot_state.lock:
+                bot_state.last_signal_time = current_time
+                bot_state.current_price = row["close"]
+
             # Handle active position
             if position:
                 fully_closed = handle_partial_exits(
@@ -203,6 +266,8 @@ def run_playbook_loop():
                 if fully_closed:
                     position = None
                     last_exit_time = current_time
+                    with bot_state.lock:
+                        bot_state.open_position = None
 
             # Check for new signal
             if not position:
@@ -216,6 +281,10 @@ def run_playbook_loop():
                         )
                     else:
                         signal = strategy.get_signal(latest_idx)
+                        with bot_state.lock:
+                            bot_state.last_signal_type = (
+                                signal.name if signal != Signal.NONE else "NONE"
+                            )
                         if signal != Signal.NONE:
                             equity = exec_engine.get_account_equity()
                             position_value = equity * 0.05
@@ -236,6 +305,8 @@ def run_playbook_loop():
                                     "tp1_hit": False,
                                     "entry_time": current_time,
                                 }
+                                with bot_state.lock:
+                                    bot_state.open_position = position.copy()
                                 logger.info(
                                     f"Entered {signal.name} at ${entry_price:.2f}, size: {size_units}"
                                 )
