@@ -121,23 +121,20 @@ def dashboard():
 PLAYBOOK_PARAMS = {"trend_relax": True, "sl_buffer": 0.005, "breakeven_after_tp1": True}
 
 
-def get_next_4h_boundary():
+def get_next_1h_boundary():
     now = datetime.now(timezone.utc)
-    delta = 4 - (now.hour % 4)
-    if delta == 4:
-        delta = 0
-    boundary = now.replace(hour=now.hour + delta, minute=0, second=0, microsecond=0)
+    boundary = now.replace(minute=0, second=0, microsecond=0)
     if boundary <= now:
-        boundary += timedelta(hours=4)
+        boundary += timedelta(hours=1)
     return boundary
 
 
-def fetch_4h_data(client, symbol, days=30):
+def fetch_1h_data(client, symbol, days=30):
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days)
     req = CryptoBarsRequest(
         symbol_or_symbols=[symbol],
-        timeframe=TimeFrame(4, TimeFrameUnit.Hour),
+        timeframe=TimeFrame(1, TimeFrameUnit.Hour),
         start=start_date,
         end=end_date,
     )
@@ -146,18 +143,38 @@ def fetch_4h_data(client, symbol, days=30):
     return bars
 
 
-def fetch_daily_data(client, symbol, days=90):
-    end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=days)
-    req = CryptoBarsRequest(
-        symbol_or_symbols=[symbol],
-        timeframe=TimeFrame(amount=1, unit=TimeFrameUnit.Day),
-        start=start_date,
-        end=end_date,
+def resample_to_4h(df_1h):
+    df_4h = (
+        df_1h.resample("4H")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna()
     )
-    bars = client.get_crypto_bars(req).df.droplevel(0)
-    bars.index = pd.to_datetime(bars.index, utc=True)
-    return bars
+    return df_4h
+
+
+def resample_to_daily(df_1h):
+    df_daily = (
+        df_1h.resample("D")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna()
+    )
+    return df_daily
 
 
 def check_health():
@@ -233,23 +250,24 @@ def run_playbook_loop():
                 logger.critical(f"Memory leak: {mem:.1f}MB")
                 return
 
-            # Wait for next 4H bar
-            next_bar = get_next_4h_boundary()
+            # Wait for next 1H bar
+            next_bar = get_next_1h_boundary()
             wait_seconds = (next_bar - datetime.now(timezone.utc)).total_seconds()
             logger.info(
-                f"Waiting for next 4H bar at {next_bar} (Wait: {wait_seconds:.1f}s)..."
+                f"Waiting for next 1H bar at {next_bar} (Wait: {wait_seconds:.1f}s)..."
             )
             if wait_seconds > 0:
                 time.sleep(wait_seconds + 10)  # Extra 10s
 
             # Fetch data
-            df_daily = fetch_daily_data(data_client, config["SYMBOL"])
-            df_4h = fetch_4h_data(data_client, config["SYMBOL"])
-            strategy = PlaybookStrategy(df_daily, df_4h, **PLAYBOOK_PARAMS)
+            df_1h = fetch_1h_data(data_client, config["SYMBOL"])
+            df_4h = resample_to_4h(df_1h)
+            df_daily = resample_to_daily(df_1h)
+            strategy = PlaybookStrategy(df_daily, df_4h, df_1h, **PLAYBOOK_PARAMS)
 
             # Get latest snapshot
-            latest_idx = len(df_4h) - 1
-            row = df_4h.iloc[latest_idx]
+            latest_idx = len(df_1h) - 1
+            row = df_1h.iloc[latest_idx]
             current_time = row.name
 
             logger.info(f"[{current_time}] Close: ${row['close']:.2f}")

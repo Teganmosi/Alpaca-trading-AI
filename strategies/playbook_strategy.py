@@ -7,20 +7,22 @@ class PlaybookStrategy:
     def __init__(
         self,
         df_daily,
-        df_4h,
+        df_trend,
+        df_entry,
         trend_relax=False,
         sl_buffer=0.005,
         breakeven_after_tp1=False,
     ):
         self.df_daily = df_daily
-        self.df_4h = df_4h
+        self.df_trend = df_trend
+        self.df_entry = df_entry
         self.trend_relax = trend_relax
         self.sl_buffer = sl_buffer
         self.breakeven_after_tp1 = breakeven_after_tp1
         # Calculate pivots on daily
         self.df_daily = self.calculate_pivots(self.df_daily)
-        # Add StochRSI to 4h
-        self.df_4h = self.add_stoch_rsi(self.df_4h)
+        # Add StochRSI to entry timeframe
+        self.df_signal = self.add_stoch_rsi(self.df_entry)
 
     def calculate_pivots(self, df):
         df = df.copy()
@@ -51,8 +53,8 @@ class PlaybookStrategy:
         return rsi
 
     def detect_trend(self, current_date):
-        # Get last 5 daily candles
-        recent = self.df_daily[self.df_daily.index <= current_date].tail(5)
+        # Get last 5 candles from trend timeframe for HH/HL trend
+        recent = self.df_trend[self.df_trend.index <= current_date].tail(5)
         if len(recent) < 5:
             return "NEUTRAL"
         highs = recent["high"]
@@ -83,9 +85,9 @@ class PlaybookStrategy:
         }
 
     def calculate_confluence(self, idx, direction):
-        row = self.df_4h.iloc[idx]
+        row = self.df_signal.iloc[idx]
         close = row["close"]
-        prev_close = self.df_4h.iloc[idx - 1]["close"] if idx > 0 else close
+        prev_close = self.df_signal.iloc[idx - 1]["close"] if idx > 0 else close
         stoch_rsi = row["stoch_rsi"]
         stoch_rsi_prev = row["stoch_rsi_prev"]
         current_date = row.name
@@ -152,7 +154,7 @@ class PlaybookStrategy:
         return stoch_ok and pivot_ok and candle_ok
 
     def get_signal(self, idx):
-        row = self.df_4h.iloc[idx]
+        row = self.df_signal.iloc[idx]
         current_date = row.name
 
         trend = self.detect_trend(current_date)
@@ -162,16 +164,28 @@ class PlaybookStrategy:
             return Signal.NONE
 
         close = row["close"]
-        prev_close = self.df_4h.iloc[idx - 1]["close"] if idx > 0 else close
+        prev_close = self.df_signal.iloc[idx - 1]["close"] if idx > 0 else close
         stoch_rsi = row["stoch_rsi"]
         stoch_rsi_prev = row["stoch_rsi_prev"]
 
-        if self._can_go_long(trend, idx) and self._check_long_conditions(
+        # Check trend filter: only long if bullish, only short if bearish
+        can_long = trend == "BULLISH" or (
+            trend == "NEUTRAL"
+            and self.trend_relax
+            and self.calculate_confluence(idx, "LONG") >= 3
+        )
+        can_short = trend == "BEARISH" or (
+            trend == "NEUTRAL"
+            and self.trend_relax
+            and self.calculate_confluence(idx, "SHORT") >= 3
+        )
+
+        if can_long and self._check_long_conditions(
             close, prev_close, stoch_rsi, stoch_rsi_prev, pivots
         ):
             return Signal.LONG
 
-        if self._can_go_short(trend, idx) and self._check_short_conditions(
+        if can_short and self._check_short_conditions(
             close, prev_close, stoch_rsi, stoch_rsi_prev, pivots
         ):
             return Signal.SHORT
@@ -181,7 +195,7 @@ class PlaybookStrategy:
     def get_stop_loss(self, direction, idx, entry_price=None):
         # Recent swing low/high
         lookback = 10
-        recent = self.df_4h.iloc[max(0, idx - lookback) : idx + 1]
+        recent = self.df_signal.iloc[max(0, idx - lookback) : idx + 1]
         if direction == "LONG":
             swing_low = recent["low"].min()
             sl = swing_low * (1 - self.sl_buffer)  # minus buffer %
@@ -208,7 +222,7 @@ class PlaybookStrategy:
     # But since backtest_engine needs to be updated, perhaps return more info
     def get_exit_signals(self, position, idx):
         # position: dict with direction, entry_price, etc.
-        row = self.df_4h.iloc[idx]
+        row = self.df_signal.iloc[idx]
         close = row["close"]
         direction = position["direction"]
         entry_price = position["entry_price"]

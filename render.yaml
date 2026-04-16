@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: trading-bot-1h-4h
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python playbook_live.py
+    envVars:
+      - key: ALPACA_API_KEY
+        value: YOUR_ALPACA_API_KEY_HERE
+      - key: ALPACA_SECRET_KEY
+        value: YOUR_ALPACA_SECRET_KEY_HERE
+      - key: TRADING_MODE
+        value: paper
+      - key: PORT
+        value: 8080

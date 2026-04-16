@@ -24,6 +24,8 @@ class BacktestEngine:
         atr_multiplier=2.2,
         lookback_period=50,
         playbook_params=None,
+        entry_timeframe="1h",
+        trend_timeframe="4h",
     ):
         self.symbol = symbol
         self.start_date = start_date
@@ -37,6 +39,8 @@ class BacktestEngine:
         self.atr_multiplier = atr_multiplier
         self.lookback_period = lookback_period
         self.playbook_params = playbook_params or {}
+        self.entry_timeframe = entry_timeframe
+        self.trend_timeframe = trend_timeframe
 
     def load_data(self):
         data_path = os.path.join(os.path.dirname(__file__), "data", "btc_history.csv")
@@ -46,22 +50,6 @@ class BacktestEngine:
         end = pd.to_datetime(self.end_date).tz_localize("UTC")
         df_15m = df_15m[(df_15m.index >= start) & (df_15m.index <= end)]
         return df_15m
-
-    def resample_to_1h(self, df_15m):
-        df_1h = (
-            df_15m.resample("1H")
-            .agg(
-                {
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                }
-            )
-            .dropna()
-        )
-        return df_1h
 
     def resample_to_4h(self, df_15m):
         df_4h = (
@@ -78,6 +66,42 @@ class BacktestEngine:
             .dropna()
         )
         return df_4h
+
+    def resample_to_1h(self, df_15m):
+        df_1h = (
+            df_15m.resample("1h")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+        )
+        return df_1h
+
+    def resample_to_30m(self, df_15m):
+        df_30m = (
+            df_15m.resample("30min")
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+        )
+        return df_30m
+
+    def resample_to_15m(self, df_15m):
+        # Already 15m, but ensure consistent
+        return df_15m
 
     def resample_to_daily(self, df_15m):
         df_daily = (
@@ -129,14 +153,33 @@ class BacktestEngine:
     def run_backtest(self):
         df_15m = self.load_data()
         df_daily = self.resample_to_daily(df_15m)
-        df_4h = self.resample_to_4h(df_15m)
-        strategy = PlaybookStrategy(df_daily, df_4h, **self.playbook_params)
+
+        # Resample trend and entry dataframes
+        if self.trend_timeframe == "4h":
+            df_trend = self.resample_to_4h(df_15m)
+        elif self.trend_timeframe == "1h":
+            df_trend = self.resample_to_1h(df_15m)
+        else:
+            raise ValueError(f"Unsupported trend_timeframe: {self.trend_timeframe}")
+
+        if self.entry_timeframe == "1h":
+            df_entry = self.resample_to_1h(df_15m)
+        elif self.entry_timeframe == "30m":
+            df_entry = self.resample_to_30m(df_15m)
+        elif self.entry_timeframe == "15m":
+            df_entry = self.resample_to_15m(df_15m)
+        else:
+            raise ValueError(f"Unsupported entry_timeframe: {self.entry_timeframe}")
+
+        strategy = PlaybookStrategy(
+            df_daily, df_trend, df_entry, **self.playbook_params
+        )
         equity = self.initial_equity
         peak_equity = equity
         trades = []
         position = None
-        for i in range(len(df_4h)):
-            row = df_4h.iloc[i]
+        for i in range(len(df_entry)):
+            row = df_entry.iloc[i]
             signal = strategy.get_signal(i)
             if position:
                 exits = strategy.get_exit_signals(position, i)
@@ -199,7 +242,7 @@ class BacktestEngine:
                     equity -= self.fee * (entry_price * size)
         # Close any remaining position at end
         if position:
-            exit_price = df_4h.iloc[-1]["close"] * (
+            exit_price = df_entry.iloc[-1]["close"] * (
                 1 + self.slippage
                 if position["direction"] == "SHORT"
                 else 1 - self.slippage
@@ -215,7 +258,7 @@ class BacktestEngine:
             trades.append(
                 {
                     "entry_time": position["entry_time"],
-                    "exit_time": df_4h.index[-1],
+                    "exit_time": df_entry.index[-1],
                     "direction": position["direction"],
                     "entry_price": position["entry_price"],
                     "exit_price": exit_price,
@@ -253,10 +296,19 @@ class BacktestEngine:
         if len(returns) > 1:
             mean_return = np.mean(returns)
             std_return = np.std(returns)
+            # Calculate trades per day based on timeframe
+            if self.entry_timeframe == "1h":
+                trades_per_day = 24
+            elif self.entry_timeframe == "30m":
+                trades_per_day = 48
+            elif self.entry_timeframe == "15m":
+                trades_per_day = 96
+            else:
+                trades_per_day = 24  # default
             sharpe = (
-                mean_return / std_return * np.sqrt(252 * 6)
+                mean_return / std_return * np.sqrt(252 * trades_per_day)
                 if std_return > 0
-                else 0  # 4H, ~6 per day
+                else 0
             )
         else:
             sharpe = 0
